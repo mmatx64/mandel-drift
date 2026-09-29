@@ -1,0 +1,25 @@
+build/
+.vs/
+out/
+smoke*.bmp
+smoke*.png
+*smoke*.txt
+cycle-*.bmp
+*-verification/
+mandel-drift.bmp
+reference-vgamandel/
+*.user
+
+# Local backups, design explorations, and verification output
+/*-backup/
+/*-before/
+/*-after/
+/verification/
+/concepts/
+/REVIEW.md
+
+# Packaged releases and generated audio
+/MandelDrift-*.zip
+/music-preview.wav
+/settings.ini
+
