@@ -326,16 +326,24 @@ Camera camera_at(double seconds) {
 // so switching to a different detail site never jumps across the complex plane.
 class DiveJourney {
  public:
+  explicit DiveJourney(bool review = false) {
+    if (review) rng_.seed(3080);
+    if (!review) {
+      site_ = -1; // No preceding destination on launch.
+      choose_site();
+      phase_ = dive_seconds() * std::uniform_real_distribution<double>(.10, .24)(rng_);
+      elapsed_ = std::uniform_real_distribution<double>(0, 300)(rng_);
+    } else {
+      julia_selected_ = true;
+      julia_cooldown_ = 2;
+    }
+  }
   void advance(double seconds) {
     phase_ += seconds;
     elapsed_ += seconds;
     while (phase_ >= cycle_duration()) {
       phase_ -= cycle_duration();
-      std::uniform_int_distribution<int> next_site(0, static_cast<int>(kSites.size()) - 2);
-      int choice = next_site(rng_);
-      if (choice >= site_) ++choice;
-      site_ = choice;
-      if (kSites[site_].min_span <= .00003) ++deep_visit_;
+      choose_site();
     }
   }
 
@@ -383,7 +391,7 @@ class DiveJourney {
   // Match the dive's log-zoom speed instead of compressing deep returns into
   // a fixed 32 seconds, especially after the quiet Julia-to-Mandelbrot return.
   double pullback_seconds() const { return dive_seconds(); }
-  bool julia_hold() const { return minimum_span() <= .00003 && deep_visit_ % 2 == 0; }
+  bool julia_hold() const { return julia_selected_; }
   double hold_duration() const { return julia_hold() ? kJuliaHoldSeconds : kHoldSeconds; }
   double cycle_duration() const { return dive_seconds() + hold_duration() + pullback_seconds(); }
   double minimum_span() const { return kSites[site_].min_span; }
@@ -413,7 +421,22 @@ class DiveJourney {
 
   std::mt19937 rng_{std::random_device{}()};
   int site_ = 0;
-  unsigned int deep_visit_ = 0;
+  bool julia_selected_ = false;
+  int julia_cooldown_ = 0;
+  void choose_site() {
+    if (site_ < 0) {
+      site_ = std::uniform_int_distribution<int>(0, static_cast<int>(kSites.size()) - 1)(rng_);
+    } else {
+      std::uniform_int_distribution<int> next_site(0, static_cast<int>(kSites.size()) - 2);
+      int choice = next_site(rng_);
+      if (choice >= site_) ++choice;
+      site_ = choice;
+    }
+    julia_selected_ = minimum_span() <= .00003 && julia_cooldown_ == 0 &&
+        std::bernoulli_distribution(.55)(rng_);
+    if (julia_selected_) julia_cooldown_ = 2;
+    else if (julia_cooldown_ > 0) --julia_cooldown_;
+  }
   double phase_ = 0.0;
   double elapsed_ = 0.0;
 };
@@ -1191,7 +1214,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
     music.set_controls(music_enabled, music_muted, music_volume);
     if (persist_settings && music_enabled && !music.start())
       std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError());
-    DiveJourney journey;
+    DiveJourney journey(smoke_test || cycle_test || motion_test);
     // Review the last 118 seconds of either Julia ramp and its quiet endpoint.
     // Separate real-time excerpts cover both ramps without speeding up time.
     const double motion_offset = motion_test ? journey.dive_seconds() +
@@ -1230,7 +1253,8 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
     std::mt19937 palette_rng(std::random_device{}());
     std::array<int, kPaletteCount - 1> palette_bag{};
     size_t palette_bag_index = palette_bag.size();
-    double camera_time = 0.0;
+    double camera_time = (smoke_test || cycle_test || motion_test) ? 0.0 : std::uniform_real_distribution<double>(0, 108)(palette_rng);
+    last_camera = dive_mode ? journey.frame() : camera_at(camera_time);
     double rotation_angle = 0.0;
     if (motion_test) rotation_angle = motion_offset * .055;
     double color_time = 0.0;
@@ -1338,7 +1362,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
           throw std::runtime_error("Mode transition failed to arrive.");
       }
 
-      DiveJourney continuity_probe;
+      DiveJourney continuity_probe(true);
       continuity_probe.advance(continuity_probe.cycle_duration() - 0.001);
       const Camera before = continuity_probe.frame();
       continuity_probe.advance(0.002);
@@ -1347,8 +1371,20 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
           std::abs(std::log(after.span / before.span)) > 0.001) {
         throw std::runtime_error("Endless dive changed abruptly at a scene boundary.");
       }
-      DiveJourney julia_probe;
-      unsigned int deep_visits = 0;
+      double first_opening_span = 0;
+      bool varied_opening = false;
+      for (int i = 0; i < 32; ++i) {
+        DiveJourney opening;
+        const Camera view = opening.frame();
+        if (!std::isfinite(view.x) || !std::isfinite(view.y) || view.span <= 0 ||
+            view.span >= 3.2 || view.julia.amount != 0)
+          throw std::runtime_error("Invalid random opening.");
+        if (i == 0) first_opening_span = view.span;
+        else varied_opening |= std::abs(view.span - first_opening_span) > .001;
+      }
+      if (!varied_opening) throw std::runtime_error("Random openings did not vary.");
+      DiveJourney julia_probe(true);
+      int julia_cooldown = 0;
       for (int cycle = 0; cycle < 24; ++cycle) {
         // Independently sample the visible camera span over both legs. This
         // catches a return-speed regression even if their endpoints still join.
@@ -1372,13 +1408,11 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
           previous_dive_span = inward_span;
           previous_return_span = outward_span;
         }
-        if (julia_probe.minimum_span() <= .00003) {
-          const bool expected = deep_visits++ % 2 == 0;
-          if (julia_probe.julia_hold() != expected)
-            throw std::runtime_error("Julia excursions did not alternate deep holds.");
-        } else if (julia_probe.julia_hold()) {
-          throw std::runtime_error("Julia appeared at a shallow site.");
-        }
+        if (julia_probe.julia_hold()) {
+          if (julia_probe.minimum_span() > .00003 || julia_cooldown > 0)
+            throw std::runtime_error("Julia eligibility or cooldown violated.");
+          julia_cooldown = 2;
+        } else if (julia_cooldown > 0) --julia_cooldown;
         // Measure actual renderer seed coordinates, including the local orbit,
         // over the complete excursion at 60 Hz, not just the base camera span.
         if (julia_probe.julia_hold()) {
@@ -1819,7 +1853,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
         const double hold_times[] = {0, kJuliaQuietSeconds + kJuliaRampSeconds * .5,
             kJuliaHoldSeconds * .5, kJuliaPlateauEnd + kJuliaRampSeconds * .5, kJuliaHoldSeconds};
         for (int probe = 0; probe < 5; ++probe) {
-          DiveJourney held_journey;
+          DiveJourney held_journey(true);
           held_journey.advance(held_journey.dive_seconds() + hold_times[probe]);
           Camera held = held_journey.frame();
           held.rotation = camera.rotation;

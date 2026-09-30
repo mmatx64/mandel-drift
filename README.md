@@ -6,7 +6,7 @@ A Windows fractal animation inspired by [vgamandel](https://codeberg.org/root42/
 
 Launch `MandelDrift.exe` on Windows with a compatible NVIDIA GPU and driver. SDL3 and the CUDA runtime are linked statically; running the app does not require the CUDA toolkit or Visual Studio. The default build targets CUDA architecture 86 (including the RTX 30 series).
 
-The app opens in a 1280×720 window. Endless dives visit four detail sites, gradually pull back, and continue to another site. A curved tour is also available. Every other deepest hold includes a slow Julia excursion with 125-second reveal and return ramps. Color waves, kaleidoscope folds, subtle bloom, and music-driven brightness add movement without distorting the controls.
+The app opens in a 1280×720 window. Each launch opens at a different gentle point in the journey. Endless dives visit the original four detail sites, gradually pull back, and randomly choose a different site for the next dive. The curved tour starts at a random point too. Deep holds have a 55% chance of a Julia excursion when eligible, with at least two intervening visits; reveal and return retain their 125-second ramps. Waves and kaleidoscope retain their fixed 96-second schedule and 3/5/7-fold symmetry sequence. Color waves, kaleidoscope folds, subtle bloom, and music-driven brightness add movement without distorting the controls.
 
 Rendering adapts its internal resolution to a 14.5 ms work budget and is capped at 60 FPS with VSync. Very demanding scenes can run slower or show fine-detail shimmer at reduced resolution.
 
