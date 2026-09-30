@@ -51,7 +51,7 @@ target_include_directories(MandelDrift PRIVATE src)
 target_link_libraries(MandelDrift PRIVATE SDL3::SDL3-static CUDA::cudart_static OpenGL::GL gdi32)
 set_target_properties(MandelDrift PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
-  CUDA_ARCHITECTURES 86
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
 )
 if(MSVC)
   target_compile_options(MandelDrift PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -63,6 +63,22 @@ install(FILES "${sdl3_SOURCE_DIR}/LICENSE.txt" DESTINATION . RENAME SDL3-LICENSE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(julia_test tests/julia_test.cpp src/mandelbrot.cu)
+  target_include_directories(julia_test PRIVATE src)
+  target_link_libraries(julia_test PRIVATE CUDA::cudart_static)
+  set_target_properties(julia_test PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME julia_numerics COMMAND julia_test)
+  set_tests_properties(julia_numerics PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(trip_effects_test tests/trip_effects_test.cpp)
+  target_include_directories(trip_effects_test PRIVATE src)
+  add_test(NAME trip_effects COMMAND trip_effects_test)
+  add_executable(mandelbrot_benchmark tests/mandelbrot_benchmark.cpp
+    tests/mandelbrot_baseline.cu src/mandelbrot.cu)
+  target_include_directories(mandelbrot_benchmark PRIVATE src)
+  target_link_libraries(mandelbrot_benchmark PRIVATE CUDA::cudart_static)
+  set_target_properties(mandelbrot_benchmark PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME mandelbrot_numerics COMMAND mandelbrot_benchmark)
+  set_tests_properties(mandelbrot_numerics PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(frame_budget_test tests/frame_budget_test.cpp)
   target_include_directories(frame_budget_test PRIVATE src)
   add_test(NAME frame_budget COMMAND frame_budget_test)

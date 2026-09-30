@@ -12,6 +12,7 @@
 #include "ambient_music.h"
 #include "bloom_shaders.h"
 #include "frame_budget.h"
+#include "trip_effects.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -141,6 +143,8 @@ uniform int palette_from;
 uniform int palette_to;
 uniform float palette_blend;
 uniform float palette_time;
+uniform vec4 trip; // wave amount, folding amount, symmetry count, rotation
+uniform float musical_breath;
 
 vec3 ramp(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
   float u = fract(t) * 3.0;
@@ -181,23 +185,44 @@ vec3 color_escape(float escape) {
     return vec3(0.004, 0.003, 0.018);
   } else {
     float phase = escape * 0.028 + palette_time * 0.035;
+    if (trip.x > 0.0)
+      phase += trip.x * (0.12 * sin(escape * 0.017 - palette_time * 0.24) +
+                          0.045 * sin(escape * 0.043 + palette_time * 0.11));
+    // The fade endpoints occupy most frames. Avoid evaluating a second
+    // palette for each of the four color-first interpolation samples.
+    float blend = smoothstep(0.0, 1.0, palette_blend);
+    if (blend == 0.0) return palette(phase, palette_from);
+    if (blend == 1.0 || palette_from == palette_to) return palette(phase, palette_to);
     vec3 color_a = palette(phase, palette_from);
     vec3 color_b = palette(phase, palette_to);
-    return mix(color_a, color_b, smoothstep(0.0, 1.0, palette_blend));
+    return mix(color_a, color_b, blend);
   }
 }
 
 void main() {
   // Escape counts are nonlinear palette inputs; interpolate colors instead.
   ivec2 size = ivec2(escape_size);
-  vec2 pos = uv * vec2(size) - 0.5;
+  vec2 sample_uv = uv;
+  if (trip.y > 0.0) {
+    float aspect = escape_size.x / escape_size.y;
+    vec2 centered = (uv - 0.5) * vec2(aspect, 1.0);
+    float radius = length(centered);
+    float angle = radius > 0.000001 ? atan(centered.y, centered.x) : 0.0;
+    float sector = 6.28318530718 / trip.z;
+    float folded = abs(mod(angle - trip.w + sector * 0.5, sector) - sector * 0.5) + trip.w;
+    // Keep rotated corners inside the source image, avoiding clamped streaks.
+    float fit = 0.48 * min(aspect, 1.0) / length(vec2(aspect, 1.0) * 0.5);
+    vec2 target = radius * fit * vec2(cos(folded), sin(folded)) / vec2(aspect, 1.0);
+    sample_uv = 0.5 + mix(centered / vec2(aspect, 1.0), target, trip.y);
+  }
+  vec2 pos = sample_uv * vec2(size) - 0.5;
   ivec2 p = ivec2(floor(pos));
   vec2 f = fract(pos);
   vec3 a = color_escape(texelFetch(escape_texture, clamp(p, ivec2(0), size - 1), 0).r);
   vec3 b = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,0), ivec2(0), size - 1), 0).r);
   vec3 c = color_escape(texelFetch(escape_texture, clamp(p + ivec2(0,1), ivec2(0), size - 1), 0).r);
   vec3 d = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,1), ivec2(0), size - 1), 0).r);
-  frag_color = vec4(mix(mix(a,b,f.x), mix(c,d,f.x), f.y), 1.0);
+  frag_color = vec4(mix(mix(a,b,f.x), mix(c,d,f.x), f.y) * (1.0 + musical_breath * 0.16), 1.0);
 }
 )GLSL";
 
@@ -241,6 +266,7 @@ struct Camera {
   double y;
   double span;
   double rotation = 0.0;
+  JuliaMorph julia{};
 };
 
 Camera camera_at(double seconds) {
@@ -303,12 +329,13 @@ class DiveJourney {
   void advance(double seconds) {
     phase_ += seconds;
     elapsed_ += seconds;
-    while (phase_ >= cycle_seconds(kSites[site_])) {
-      phase_ -= cycle_seconds(kSites[site_]);
+    while (phase_ >= cycle_duration()) {
+      phase_ -= cycle_duration();
       std::uniform_int_distribution<int> next_site(0, static_cast<int>(kSites.size()) - 2);
       int choice = next_site(rng_);
       if (choice >= site_) ++choice;
       site_ = choice;
+      if (kSites[site_].min_span <= .00003) ++deep_visit_;
     }
   }
 
@@ -320,8 +347,8 @@ class DiveJourney {
       const double t = smooth(phase_ / dive_seconds);
       span = std::exp(std::log(kWideSpan) +
                       (std::log(site.min_span) - std::log(kWideSpan)) * t);
-    } else if (phase_ >= dive_seconds + kHoldSeconds) {
-      const double t = smooth((phase_ - dive_seconds - kHoldSeconds) / kPullbackSeconds);
+    } else if (phase_ >= dive_seconds + hold_duration()) {
+      const double t = smooth((phase_ - dive_seconds - hold_duration()) / pullback_seconds());
       span = std::exp(std::log(site.min_span) +
                       (std::log(kWideSpan) - std::log(site.min_span)) * t);
     }
@@ -332,19 +359,35 @@ class DiveJourney {
     x += span * (0.035 * std::sin(elapsed_ * 0.19) +
                  0.025 * std::sin(elapsed_ * 0.073 + 0.4));
     y += span * 0.03 * std::sin(elapsed_ * 0.127 + 1.3);
-    if (phase_ >= dive_seconds && phase_ < dive_seconds + kHoldSeconds) {
-      const double hold = (phase_ - dive_seconds) / kHoldSeconds;
+    if (phase_ >= dive_seconds && phase_ < dive_seconds + hold_duration()) {
+      const double hold = (phase_ - dive_seconds) / hold_duration();
       x += span * 0.12 * std::sin(hold * 3.141592653589793);
     }
-    return {x, y, span};
+    Camera camera{x, y, span};
+    if (julia_hold())
+      camera.julia = julia_morph(julia_hold_amount(phase_ - dive_seconds), span, site.x, site.y,
+                                 phase_ - dive_seconds);
+    // The wider Julia silhouette stays centered, independent of the local
+    // camera orbit and sideways motion used at a deep Mandelbrot hold.
+    const double centered = julia_center_amount(camera.julia.amount, span * camera.julia.seed_scale);
+    camera.julia.seed_shift_x -= centered * (x - site.x) * camera.julia.seed_scale;
+    camera.julia.seed_shift_y -= centered * (y - site.y) * camera.julia.seed_scale;
+    return camera;
   }
 
   std::array<double, 2> reference_point() const {
     return {kSites[site_].x, kSites[site_].y};
   }
 
-  double cycle_duration() const { return cycle_seconds(kSites[site_]); }
+  double dive_seconds() const { return dive_duration(kSites[site_]); }
+  // Match the dive's log-zoom speed instead of compressing deep returns into
+  // a fixed 32 seconds, especially after the quiet Julia-to-Mandelbrot return.
+  double pullback_seconds() const { return dive_seconds(); }
+  bool julia_hold() const { return minimum_span() <= .00003 && deep_visit_ % 2 == 0; }
+  double hold_duration() const { return julia_hold() ? kJuliaHoldSeconds : kHoldSeconds; }
+  double cycle_duration() const { return dive_seconds() + hold_duration() + pullback_seconds(); }
   double minimum_span() const { return kSites[site_].min_span; }
+  bool diving() const { return phase_ < dive_duration(kSites[site_]); }
 
  private:
   struct DiveSite {
@@ -362,29 +405,51 @@ class DiveJourney {
   static constexpr double kWideY = 0.0;
   static constexpr double kWideSpan = 3.2;
   static constexpr double kHoldSeconds = 10.0;
-  static constexpr double kPullbackSeconds = 32.0;
 
   static double dive_duration(const DiveSite& site) {
     return std::clamp(8.2 * std::log(kWideSpan / site.min_span), 75.0, 180.0);
   }
-  static double cycle_seconds(const DiveSite& site) {
-    return dive_duration(site) + kHoldSeconds + kPullbackSeconds;
-  }
-
   static double smooth(double t) { return t * t * (3.0 - 2.0 * t); }
 
   std::mt19937 rng_{std::random_device{}()};
   int site_ = 0;
+  unsigned int deep_visit_ = 0;
   double phase_ = 0.0;
   double elapsed_ = 0.0;
 };
 
 Camera blend_camera(const Camera& from, const Camera& to, double t) {
   const double ease = t * t * (3.0 - 2.0 * t);
-  return {from.x + (to.x - from.x) * ease,
-          from.y + (to.y - from.y) * ease,
-          std::exp(std::log(from.span) +
-                   (std::log(to.span) - std::log(from.span)) * ease)};
+  Camera camera{from.x + (to.x - from.x) * ease,
+                from.y + (to.y - from.y) * ease,
+                std::exp(std::log(from.span) +
+                         (std::log(to.span) - std::log(from.span)) * ease)};
+  const double amount = from.julia.amount + (to.julia.amount - from.julia.amount) * ease;
+  if (amount > 0) {
+    const JuliaMorph& anchor = from.julia.amount > 0 ? from.julia : to.julia;
+    const double seed_span = std::exp(std::log(from.span * from.julia.seed_scale) +
+        (std::log(to.span * to.julia.seed_scale) - std::log(from.span * from.julia.seed_scale)) * ease);
+    camera.julia = {amount, seed_span / camera.span, anchor.x, anchor.y};
+    // Interpolate absolute seed centers, then express them relative to the
+    // shared anchor. This also makes repeated mode toggles continuous.
+    const double seed_from_x = from.julia.amount > 0 ? from.julia.x + from.julia.seed_shift_x +
+        (from.x - from.julia.x) * from.julia.seed_scale : from.x;
+    const double seed_from_y = from.julia.amount > 0 ? from.julia.y + from.julia.seed_shift_y +
+        (from.y - from.julia.y) * from.julia.seed_scale : from.y;
+    const double seed_to_x = to.julia.amount > 0 ? to.julia.x + to.julia.seed_shift_x +
+        (to.x - to.julia.x) * to.julia.seed_scale : to.x;
+    const double seed_to_y = to.julia.amount > 0 ? to.julia.y + to.julia.seed_shift_y +
+        (to.y - to.julia.y) * to.julia.seed_scale : to.y;
+    camera.julia.seed_shift_x = seed_from_x + (seed_to_x - seed_from_x) * ease -
+        anchor.x - (camera.x - anchor.x) * camera.julia.seed_scale;
+    camera.julia.seed_shift_y = seed_from_y + (seed_to_y - seed_from_y) * ease -
+        anchor.y - (camera.y - anchor.y) * camera.julia.seed_scale;
+    camera.julia.parameter_shift_x = from.julia.parameter_shift_x +
+        (to.julia.parameter_shift_x - from.julia.parameter_shift_x) * ease;
+    camera.julia.parameter_shift_y = from.julia.parameter_shift_y +
+        (to.julia.parameter_shift_y - from.julia.parameter_shift_y) * ease;
+  }
+  return camera;
 }
 
 // Travel between sites only after pulling back far enough to see the distance.
@@ -436,8 +501,10 @@ class Renderer {
                "Find CUDA device for OpenGL window");
     if (count == 0) throw std::runtime_error("OpenGL is not running on an NVIDIA CUDA device.");
     check_cuda(cudaSetDevice(devices[0]), "Select NVIDIA GPU");
-    check_cuda(cudaEventCreate(&start_), "Create CUDA timer");
-    check_cuda(cudaEventCreate(&stop_), "Create CUDA timer");
+    for (auto& timing : frame_timings_) {
+      check_cuda(cudaEventCreate(&timing.start), "Create CUDA start timer");
+      check_cuda(cudaEventCreate(&timing.stop), "Create CUDA stop timer");
+    }
     gl_.GenQueries(4, post_queries_);
 
     gl_.GenVertexArrays(1, &vao_);
@@ -447,6 +514,8 @@ class Renderer {
     palette_to_location_ = gl_.GetUniformLocation(program_, "palette_to");
     palette_blend_location_ = gl_.GetUniformLocation(program_, "palette_blend");
     time_location_ = gl_.GetUniformLocation(program_, "palette_time");
+    trip_location_ = gl_.GetUniformLocation(program_, "trip");
+    breath_location_ = gl_.GetUniformLocation(program_, "musical_breath");
     escape_size_location_ = gl_.GetUniformLocation(program_, "escape_size");
     gl_.UseProgram(temporal_program_);
     gl_.Uniform1i(gl_.GetUniformLocation(temporal_program_, "current_color"), 0);
@@ -470,14 +539,17 @@ class Renderer {
     release_image();
     release_history();
     if (reference_orbit_) cudaFree(reference_orbit_);
+    if (fold_detail_) cudaFree(fold_detail_);
     if (vao_) gl_.DeleteVertexArrays(1, &vao_);
     if (program_) gl_.DeleteProgram(program_);
     if (temporal_program_) gl_.DeleteProgram(temporal_program_);
     if (bloom_extract_program_) gl_.DeleteProgram(bloom_extract_program_);
     if (bloom_blur_program_) gl_.DeleteProgram(bloom_blur_program_);
     if (bloom_composite_program_) gl_.DeleteProgram(bloom_composite_program_);
-    if (start_) cudaEventDestroy(start_);
-    if (stop_) cudaEventDestroy(stop_);
+    for (auto& timing : frame_timings_) {
+      if (timing.start) cudaEventDestroy(timing.start);
+      if (timing.stop) cudaEventDestroy(timing.stop);
+    }
   }
 
   void resize(int width, int height, int capacity_width, int capacity_height) {
@@ -493,7 +565,6 @@ class Renderer {
     height_ = height;
     capacity_width_ = capacity_width;
     capacity_height_ = capacity_height;
-
     gl_.GenBuffers(1, &pbo_);
     gl_.BindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
     gl_.BufferData(GL_PIXEL_UNPACK_BUFFER,
@@ -517,37 +588,55 @@ class Renderer {
   float draw(const Camera& camera, int palette_from, int palette_to,
              float palette_blend, float palette_time,
              int output_width, int output_height,
-             const std::array<double, 2>& journey_reference, bool bloom_enabled) {
+             const std::array<double, 2>& journey_reference, bool bloom_enabled,
+             TripEffects effects, float fold_angle, float musical_breath, bool visual_probe = false) {
     const Uint64 draw_start = SDL_GetTicksNS();
-    const bool deep_zoom = camera.span < 0.0045;
+    timing_sample_ready_ = false;
+    const bool morphing = camera.julia.amount > 0;
+    const bool wide_julia = morphing && camera.span * camera.julia.seed_scale >= kJuliaFloatSpan;
+    const bool deep_zoom = camera.span < 0.0045 || morphing;
+    // Release unused scratch between dives, but avoid allocation churn near
+    // the precision switch. cudaFree orders release after outstanding work.
+    update_queue_retention(morphing ? std::min(camera.span, .0045) : camera.span, draw_start);
     const int iterations = std::clamp(
         260 + static_cast<int>(58.0 * std::log2(3.2 / camera.span)),
         260, deep_zoom ? 2200 : 850);
     int reference_length = 0;
     double reference_offset_x = 0.0;
     double reference_offset_y = 0.0;
-    if (deep_zoom) {
+    if (deep_zoom && !wide_julia) {
       if (!reference_orbit_) {
         check_cuda(cudaMalloc(reinterpret_cast<void**>(&reference_orbit_),
                               2201 * sizeof(float2)), "Allocate reference orbit");
       }
       const bool site_nearby = std::hypot(camera.x - journey_reference[0],
                                          camera.y - journey_reference[1]) < camera.span * 0.45;
-      const double reference_x = site_nearby ? journey_reference[0] : camera.x;
-      const double reference_y = site_nearby ? journey_reference[1] : camera.y;
+      const double reference_x = morphing ? camera.julia.x : (site_nearby ? journey_reference[0] : camera.x);
+      const double reference_y = morphing ? camera.julia.y : (site_nearby ? journey_reference[1] : camera.y);
       reference_offset_x = reference_x - camera.x;
       reference_offset_y = reference_y - camera.y;
+      const double seed_shift_x = morphing ? camera.julia.seed_shift_x : 0;
+      const double seed_shift_y = morphing ? camera.julia.seed_shift_y : 0;
+      const double parameter_shift_x = morphing ? camera.julia.parameter_shift_x : 0;
+      const double parameter_shift_y = morphing ? camera.julia.parameter_shift_y : 0;
       if (!cached_reference_valid_ || reference_x != cached_reference_x_ ||
-          reference_y != cached_reference_y_) {
+          reference_y != cached_reference_y_ || seed_shift_x != cached_seed_shift_x_ ||
+          seed_shift_y != cached_seed_shift_y_ || parameter_shift_x != cached_parameter_shift_x_ ||
+          parameter_shift_y != cached_parameter_shift_y_) {
         std::vector<float2> reference;
         reference.reserve(2201);
         double zx = 0.0, zy = 0.0;
         for (int index = 0; index <= 2200; ++index) {
           reference.push_back(float2{static_cast<float>(zx), static_cast<float>(zy)});
           if (zx * zx + zy * zy > 256.0) break;
-          const double next_x = zx * zx - zy * zy + reference_x;
-          zy = 2.0 * zx * zy + reference_y;
-          zx = next_x;
+          if (index == 0) {
+            zx = reference_x + seed_shift_x;
+            zy = reference_y + seed_shift_y;
+          } else {
+            const double next_x = zx * zx - zy * zy + reference_x + parameter_shift_x;
+            zy = 2.0 * zx * zy + reference_y + parameter_shift_y;
+            zx = next_x;
+          }
         }
         cached_reference_length_ = static_cast<int>(reference.size());
         check_cuda(cudaMemcpy(reference_orbit_, reference.data(),
@@ -555,10 +644,21 @@ class Renderer {
                    "Upload reference orbit");
         cached_reference_x_ = reference_x;
         cached_reference_y_ = reference_y;
+        cached_seed_shift_x_ = seed_shift_x;
+        cached_seed_shift_y_ = seed_shift_y;
+        cached_parameter_shift_x_ = parameter_shift_x;
+        cached_parameter_shift_y_ = parameter_shift_y;
         cached_reference_valid_ = true;
       }
       reference_length = cached_reference_length_;
+      // Shallow scenes and short references never use the queued fallback.
+      // Retain full capacity across quality changes and short shallow visits.
+      if (reference_length > iterations && !fallback_queue_.pixels) {
+        allocate_fallback_queue();
+      }
     }
+    if (effects.folding > 0 && !fold_detail_)
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&fold_detail_), sizeof(float4)), "Allocate fold detail summary");
     check_cuda(cudaGraphicsMapResources(1, &cuda_resource_), "Map shared image");
     float* device_pixels = nullptr;
     size_t bytes = 0;
@@ -570,40 +670,62 @@ class Renderer {
       throw std::runtime_error("Shared image buffer is too small.");
     }
 
-    check_cuda(cudaEventRecord(start_), "Start CUDA timer");
-    result = deep_zoom
-        ? launch_mandelbrot_perturbed(device_pixels, width_, height_,
+    // Mapping orders earlier OpenGL work before this frame's CUDA work.
+    // Collect completed CUDA/GL pairs without ever waiting for telemetry.
+    collect_frame_timings(output_width, output_height);
+    const bool timing = query_count_ < 4;
+    auto& frame_timing = frame_timings_[query_write_];
+    if (timing) check_cuda(cudaEventRecord(frame_timing.start), "Start CUDA timer");
+    result = morphing
+        ? launch_julia_morph(device_pixels, width_, height_, camera.x, camera.y, camera.span,
+                             camera.rotation, camera.julia, reference_orbit_, reference_length,
+                             iterations, reference_length > iterations ? fallback_queue_ : MandelbrotFallbackQueue{})
+        : deep_zoom ? launch_mandelbrot_perturbed(device_pixels, width_, height_,
                                      camera.x, camera.y, camera.span, camera.rotation,
                                      reference_offset_x, reference_offset_y,
-                                     reference_orbit_, reference_length, iterations)
+                                     reference_orbit_, reference_length, iterations, nullptr,
+                                     reference_length > iterations ? fallback_queue_ : MandelbrotFallbackQueue{})
         : launch_mandelbrot(device_pixels, width_, height_,
                             static_cast<float>(camera.x),
                             static_cast<float>(camera.y),
                             static_cast<float>(camera.span),
                             static_cast<float>(camera.rotation), iterations);
-    cudaError_t timer_result = cudaEventRecord(stop_);
+    const bool probe_fold = effects.folding > 0 &&
+        (!fold_detail_ || draw_start - fold_probe_time_ >= 500'000'000ULL);
+    if (effects.folding == 0) {
+      fold_detail_weight_ = fold_detail_target_ = 0;
+      fold_probe_time_ = 0; // A later fold must establish fresh scene detail.
+    }
+    if (probe_fold) {
+      check_cuda(measure_fold_detail(device_pixels, width_, height_, effects.folds, fold_angle, fold_detail_),
+                 "Measure kaleidoscope detail");
+      fold_probe_time_ = draw_start;
+    }
+    cudaError_t timer_result = timing ? cudaEventRecord(frame_timing.stop) : cudaSuccess;
     cudaError_t unmap_result = cudaGraphicsUnmapResources(1, &cuda_resource_);
     check_cuda(result, "Render Mandelbrot frame");
     check_cuda(timer_result, "Stop CUDA timer");
     check_cuda(unmap_result, "Unmap shared image");
-    check_cuda(cudaEventSynchronize(stop_), "Wait for Mandelbrot frame");
-    float kernel_ms = 0.0f;
-    check_cuda(cudaEventElapsedTime(&kernel_ms, start_, stop_), "Read CUDA timer");
-
-    pre_post_ms_ = (SDL_GetTicksNS() - draw_start) / 1.0e6;
-    // Consume completed queries only. Never stall the GPU to obtain telemetry.
-    while (query_count_ > 0) {
-      GLint ready = GL_FALSE;
-      gl_.GetQueryObjectiv(post_queries_[query_read_], GL_QUERY_RESULT_AVAILABLE, &ready);
-      if (!ready) break;
-      GLuint64 elapsed = 0;
-      gl_.GetQueryObjectui64v(post_queries_[query_read_], GL_QUERY_RESULT, &elapsed);
-      post_ms_ = elapsed / 1.0e6;
-      query_read_ = (query_read_ + 1) % 4;
-      --query_count_;
+    // Unmapping orders these CUDA writes before subsequent OpenGL use.
+    // Only the infrequent fold probe needs a CPU readback of this frame.
+    if (probe_fold) {
+      float4 detail;
+      check_cuda(cudaMemcpy(&detail, fold_detail_, sizeof(detail), cudaMemcpyDeviceToHost), "Read fold detail summary");
+      fold_detail_target_ = folding_detail_weight(detail.x, detail.y, detail.z, detail.w);
     }
-    const bool timing = query_count_ < 4;
-    if (timing) gl_.BeginQuery(GL_TIME_ELAPSED, post_queries_[query_write_]);
+    const double effect_dt = previous_effect_time_ ? std::min((draw_start - previous_effect_time_) / 1.0e9, .1) : 0;
+    previous_effect_time_ = draw_start;
+    fold_detail_weight_ += (fold_detail_target_ - fold_detail_weight_) * static_cast<float>(1 - std::exp(-effect_dt / .6));
+    if (!visual_probe) effects.folding *= fold_detail_weight_;
+    if (effects.folding < .001f) effects.folding = 0;
+    if (timing) {
+      frame_timing.pre_post_ms = (SDL_GetTicksNS() - draw_start) / 1.0e6;
+      frame_timing.width = width_;
+      frame_timing.height = height_;
+      frame_timing.output_width = output_width;
+      frame_timing.output_height = output_height;
+      gl_.BeginQuery(GL_TIME_ELAPSED, post_queries_[query_write_]);
+    }
 
     gl_.ActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture_);
@@ -621,6 +743,8 @@ class Renderer {
     gl_.Uniform1i(palette_to_location_, palette_to);
     gl_.Uniform1f(palette_blend_location_, palette_blend);
     gl_.Uniform1f(time_location_, palette_time);
+    gl_.Uniform4f(trip_location_, effects.waves, effects.folding, static_cast<float>(effects.folds), fold_angle);
+    gl_.Uniform1f(breath_location_, musical_breath);
     gl_.Uniform2f(escape_size_location_, static_cast<float>(width_), static_cast<float>(height_));
     gl_.BindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -633,6 +757,17 @@ class Renderer {
     gl_.ActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, history_color_[history_index_]);
     float weight = history_valid_ ? 0.78f : 0.0f;
+    // A changing nonlinear fold cannot use the camera's affine reprojection.
+    // Suppress stale history through folding and its first normal frame.
+    if (effects.folding > 0 || previous_folding_ > 0) weight = 0.0f;
+    // Parameter morphs do not follow affine camera motion. Frozen Julia views
+    // can accumulate history again; changing parameters and both edges cannot.
+    if (camera.julia.amount != previous_camera_.julia.amount ||
+        camera.julia.seed_scale != previous_camera_.julia.seed_scale ||
+        camera.julia.seed_shift_x != previous_camera_.julia.seed_shift_x ||
+        camera.julia.seed_shift_y != previous_camera_.julia.seed_shift_y ||
+        camera.julia.parameter_shift_x != previous_camera_.julia.parameter_shift_x ||
+        camera.julia.parameter_shift_y != previous_camera_.julia.parameter_shift_y) weight = 0.0f;
     double m00 = 1.0, m01 = 0.0, m10 = 0.0, m11 = 1.0;
     double tx = 0.0, ty = 0.0;
     if (history_valid_) {
@@ -663,18 +798,21 @@ class Renderer {
     history_index_ = write_index;
     history_valid_ = true;
     previous_camera_ = camera;
+    previous_folding_ = effects.folding;
     present(bloom_enabled);
     if (timing) {
       gl_.EndQuery(GL_TIME_ELAPSED);
+      frame_timing.submit_ms = (SDL_GetTicksNS() - draw_start) / 1.0e6;
       query_write_ = (query_write_ + 1) % 4;
       ++query_count_;
     }
-    work_ms_ = std::max((SDL_GetTicksNS() - draw_start) / 1.0e6, pre_post_ms_ + post_ms_);
-    return kernel_ms;
+    return kernel_ms_;
   }
 
   double work_ms() const { return work_ms_; }
   double post_ms() const { return post_ms_; }
+  bool timing_sample_ready() const { return timing_sample_ready_; }
+  float folding_amount() const { return previous_folding_; }
 
   // Bloom stays outside temporal history, avoiding glow accumulation and trails.
   // Re-presenting also allows an exact same-frame comparison in the smoke test.
@@ -736,7 +874,68 @@ class Renderer {
     }
   }
 
+  void check_fallback_queue_lifecycle() {
+    if (!fallback_queue_.pixels || !fallback_queue_.count)
+      throw std::runtime_error("Deep frame did not allocate its fallback queue.");
+    queue_idle_since_ = 0;
+    update_queue_retention(0.009, 1'000'000'000ULL);
+    update_queue_retention(0.006, 2'500'000'000ULL); // Threshold visit cancels release.
+    update_queue_retention(0.009, 3'000'000'000ULL);
+    update_queue_retention(0.009, 4'999'999'999ULL);
+    if (!fallback_queue_.pixels || !fallback_queue_.count)
+      throw std::runtime_error("Fallback queue released before the idle grace period.");
+    update_queue_retention(0.009, 5'000'000'000ULL);
+    if (fallback_queue_.pixels || fallback_queue_.count || queue_idle_since_)
+      throw std::runtime_error("Idle fallback queue was not released.");
+    allocate_fallback_queue(); // The next deep frame must reuse the new allocation.
+  }
+
  private:
+  void collect_frame_timings(int output_width, int output_height) {
+    while (query_count_ > 0) {
+      const auto& timing = frame_timings_[query_read_];
+      const auto result = cudaEventQuery(timing.stop);
+      if (result == cudaErrorNotReady) break;
+      check_cuda(result, "Query CUDA timer");
+      GLint ready = GL_FALSE;
+      gl_.GetQueryObjectiv(post_queries_[query_read_], GL_QUERY_RESULT_AVAILABLE, &ready);
+      if (!ready) break;
+      float kernel_ms = 0;
+      check_cuda(cudaEventElapsedTime(&kernel_ms, timing.start, timing.stop), "Read CUDA timer");
+      GLuint64 elapsed = 0;
+      gl_.GetQueryObjectui64v(post_queries_[query_read_], GL_QUERY_RESULT, &elapsed);
+      // A delayed sample from another resolution must not steer today's scale.
+      // Pair GPU stages from the same frame, including execution that happened
+      // after the CPU finished submitting work. Avoid counting a CPU wait twice.
+      if (timing.width == width_ && timing.height == height_ &&
+          timing.output_width == output_width && timing.output_height == output_height) {
+        kernel_ms_ = kernel_ms;
+        post_ms_ = elapsed / 1.0e6;
+        work_ms_ = std::max(timing.submit_ms,
+            std::max(timing.pre_post_ms, static_cast<double>(kernel_ms)) + post_ms_);
+        timing_sample_ready_ = true;
+      }
+      query_read_ = (query_read_ + 1) % 4;
+      --query_count_;
+    }
+  }
+
+  void allocate_fallback_queue() {
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&fallback_queue_.pixels),
+        static_cast<size_t>(capacity_width_) * capacity_height_ * sizeof(int)),
+        "Allocate fallback pixel queue");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&fallback_queue_.count), sizeof(unsigned int)),
+        "Allocate fallback counter");
+  }
+
+  void update_queue_retention(double span, Uint64 now) {
+    if (fallback_queue_.pixels && span >= 0.009) {
+      if (!queue_idle_since_) queue_idle_since_ = now;
+      if (now - queue_idle_since_ >= 2'000'000'000ULL) release_fallback_queue();
+    } else {
+      queue_idle_since_ = 0;
+    }
+  }
   void create_color_target(GLuint& framebuffer, GLuint& texture,
                            int width, int height) {
     gl_.ActiveTexture(GL_TEXTURE0);
@@ -790,7 +989,15 @@ class Renderer {
     history_height_ = height;
   }
 
+  void release_fallback_queue() {
+    if (fallback_queue_.pixels) cudaFree(fallback_queue_.pixels);
+    if (fallback_queue_.count) cudaFree(fallback_queue_.count);
+    fallback_queue_ = {};
+    queue_idle_since_ = 0;
+  }
+
   void release_image() {
+    release_fallback_queue();
     if (cuda_resource_) {
       glFinish();
       cudaGraphicsUnregisterResource(cuda_resource_);
@@ -820,7 +1027,9 @@ class Renderer {
   int capacity_height_ = 0;
   GLuint post_queries_[4]{};
   int query_read_ = 0, query_write_ = 0, query_count_ = 0;
-  double pre_post_ms_ = 0.0, post_ms_ = 2.0, work_ms_ = 0.0;
+  double post_ms_ = 2.0, work_ms_ = 0.0;
+  float kernel_ms_ = 0;
+  bool timing_sample_ready_ = false;
   GLint escape_size_location_ = -1;
   GLuint current_fbo_ = 0;
   GLuint current_color_ = 0;
@@ -832,13 +1041,25 @@ class Renderer {
   bool history_valid_ = false;
   Camera previous_camera_{};
   cudaGraphicsResource* cuda_resource_ = nullptr;
-  cudaEvent_t start_ = nullptr;
-  cudaEvent_t stop_ = nullptr;
+  struct FrameTiming {
+    cudaEvent_t start = nullptr, stop = nullptr;
+    double pre_post_ms = 0, submit_ms = 0;
+    int width = 0, height = 0, output_width = 0, output_height = 0;
+  };
+  FrameTiming frame_timings_[4]{};
   float2* reference_orbit_ = nullptr;
+  float4* fold_detail_ = nullptr;
+  Uint64 fold_probe_time_ = 0, previous_effect_time_ = 0;
+  float fold_detail_target_ = 0, fold_detail_weight_ = 0;
+  MandelbrotFallbackQueue fallback_queue_{};
+  Uint64 queue_idle_since_ = 0;
   GLint palette_from_location_ = -1;
   GLint palette_to_location_ = -1;
   GLint palette_blend_location_ = -1;
   GLint time_location_ = -1;
+  GLint trip_location_ = -1;
+  GLint breath_location_ = -1;
+  float previous_folding_ = 0;
   GLint matrix_location_ = -1;
   GLint translation_location_ = -1;
   GLint pixel_step_location_ = -1;
@@ -849,6 +1070,8 @@ class Renderer {
   double cached_reference_x_ = 0.0;
   double cached_reference_y_ = 0.0;
   int cached_reference_length_ = 0;
+  double cached_seed_shift_x_ = 0, cached_seed_shift_y_ = 0;
+  double cached_parameter_shift_x_ = 0, cached_parameter_shift_y_ = 0;
 };
 
 // Preserve the saved fullscreen value; legacy borderless (1) loads as windowed.
@@ -889,15 +1112,16 @@ constexpr double kPaletteFadeSeconds = 1.5;
 
 void save_screenshot(int width, int height, const char* path) {
   std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
-  std::vector<unsigned char> flipped(pixels.size());
   glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
   const size_t stride = static_cast<size_t>(width) * 4;
-  for (int y = 0; y < height; ++y) {
-    std::memcpy(flipped.data() + y * stride,
-                pixels.data() + (height - 1 - y) * stride, stride);
+  // Flip in place: a second full-size image doubled screenshot RAM use.
+  for (int y = 0; y < height / 2; ++y) {
+    auto first = pixels.begin() + y * stride;
+    auto opposite = pixels.begin() + (height - 1 - y) * stride;
+    std::swap_ranges(first, first + stride, opposite);
   }
   SDL_Surface* surface = SDL_CreateSurfaceFrom(
-      width, height, SDL_PIXELFORMAT_RGBA32, flipped.data(), static_cast<int>(stride));
+      width, height, SDL_PIXELFORMAT_RGBA32, pixels.data(), static_cast<int>(stride));
   if (!surface) throw std::runtime_error(SDL_GetError());
   const bool saved = SDL_SaveBMP(surface, path);
   SDL_DestroySurface(surface);
@@ -917,7 +1141,7 @@ std::string save_user_screenshot(int width, int height) {
   return filename;
 }
 
-int run(bool smoke_test, bool cycle_test) {
+int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_return = false) {
   if (!SDL_Init(SDL_INIT_VIDEO)) throw std::runtime_error(SDL_GetError());
   const char* base_path = SDL_GetBasePath();
   if (!base_path) throw std::runtime_error(SDL_GetError());
@@ -968,17 +1192,32 @@ int run(bool smoke_test, bool cycle_test) {
     if (persist_settings && music_enabled && !music.start())
       std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError());
     DiveJourney journey;
+    // Review the last 118 seconds of either Julia ramp and its quiet endpoint.
+    // Separate real-time excerpts cover both ramps without speeding up time.
+    const double motion_offset = motion_test ? journey.dive_seconds() +
+        (motion_return ? kJuliaHoldSeconds : kJuliaPlateauStart + kJuliaQuietSeconds) - 120.0 : 0.0;
+    if (motion_test) journey.advance(motion_offset);
+    std::FILE* motion_file = nullptr;
+    if (motion_test && fopen_s(&motion_file, "motion-trace.csv", "w") != 0)
+      throw std::runtime_error("Could not create camera motion trace.");
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> motion_trace(motion_file, &std::fclose);
+    if (motion_test) {
+      std::fprintf(motion_trace.get(), "wall_seconds,journey_seconds,stage,wall_dt,camera_dt,base_span,seed_span,julia_amount,base_log_speed,seed_log_speed,seed_pan_spans_per_second,seed_center_x,seed_center_y,parameter_x,parameter_y,rotation,render_width,render_height,kernel_ms,work_ms\n");
+      std::fprintf(stderr, "Motion review: 120 real-time seconds, journey offset %.6f, fullscreen; positive log speed = pullback\n", motion_offset);
+    }
     const double test_cycle_duration = journey.cycle_duration();
     double cycle_elapsed = 0.0;
     double next_cycle_log = 0.0;
     size_t cycle_capture = 0;
-    const std::array<double, 10> capture_times{{
-        (test_cycle_duration - 42.0) * 0.34,
-        (test_cycle_duration - 42.0) * 0.62,
-        (test_cycle_duration - 42.0) * 0.78, test_cycle_duration - 49.0,
-        test_cycle_duration - 42.0, test_cycle_duration - 37.0,
-        test_cycle_duration - 36.8, test_cycle_duration - 32.0,
-        test_cycle_duration - 16.0, test_cycle_duration + 1.0}};
+    const std::array<double, 10> capture_times = motion_test
+        ? std::array<double, 10>{{0, 10, 30, 50, 56, 62, 76, 82, 94, 114}}
+        : std::array<double, 10>{{
+        journey.dive_seconds() * 0.34,
+        journey.dive_seconds() * 0.62,
+        journey.dive_seconds() * 0.78, journey.dive_seconds() - 7.0,
+        journey.dive_seconds(), journey.dive_seconds() + kJuliaQuietSeconds + kJuliaRampSeconds * .5,
+        journey.dive_seconds() + kJuliaHoldSeconds * .5, test_cycle_duration - journey.pullback_seconds(),
+        test_cycle_duration - journey.pullback_seconds() * .5, test_cycle_duration + 1.0}};
     Camera last_camera = dive_mode ? journey.frame() : camera_at(0.0);
     CameraTransition transition;
     bool rotation_enabled = preferences.rotation;
@@ -993,7 +1232,14 @@ int run(bool smoke_test, bool cycle_test) {
     size_t palette_bag_index = palette_bag.size();
     double camera_time = 0.0;
     double rotation_angle = 0.0;
+    if (motion_test) rotation_angle = motion_offset * .055;
     double color_time = 0.0;
+    double trip_time = 0.0;
+    if (motion_test) trip_time = motion_offset;
+    double previous_motion_base_span = 0, previous_motion_seed_span = 0;
+    double previous_motion_seed_x = 0, previous_motion_seed_y = 0;
+    const auto motion_wall_start = std::chrono::steady_clock::now();
+    float musical_breath = 0;
     double palette_timer = 0.0;
     FrameBudget frame_budget;
     std::vector<double> cycle_intervals;
@@ -1002,6 +1248,7 @@ int run(bool smoke_test, bool cycle_test) {
     double title_timer = 0.0;
     int title_frames = 0;
     int total_frames = 0;
+    int valid_timing_samples = 0;
     bool screenshot_requested = false;
     bool smoke_blend_saved = false;
     bool smoke_final_saved = false;
@@ -1099,6 +1346,88 @@ int run(bool smoke_test, bool cycle_test) {
       if (std::hypot(after.x - before.x, after.y - before.y) > 0.001 ||
           std::abs(std::log(after.span / before.span)) > 0.001) {
         throw std::runtime_error("Endless dive changed abruptly at a scene boundary.");
+      }
+      DiveJourney julia_probe;
+      unsigned int deep_visits = 0;
+      for (int cycle = 0; cycle < 24; ++cycle) {
+        // Independently sample the visible camera span over both legs. This
+        // catches a return-speed regression even if their endpoints still join.
+        const double dive = julia_probe.dive_seconds();
+        const double pullback = julia_probe.pullback_seconds();
+        double previous_dive_span = 3.2;
+        double previous_return_span = 3.2;
+        for (int sample = 0; sample <= 120; ++sample) {
+          const double t = dive * sample / 120;
+          auto inward = julia_probe;
+          auto outward = julia_probe;
+          inward.advance(t);
+          outward.advance(dive + julia_probe.hold_duration() + pullback - t);
+          const double inward_span = inward.frame().span;
+          const double outward_span = outward.frame().span;
+          if (std::abs(std::log(inward_span / outward_span)) > 1e-10)
+            throw std::runtime_error("Pullback no longer matches the dive's zoom progression.");
+          if (sample > 0 && (std::abs(std::log(inward_span / previous_dive_span)) / (dive / 120) > .185 ||
+                            std::abs(std::log(outward_span / previous_return_span)) / (dive / 120) > .185))
+            throw std::runtime_error("Journey zoom exceeded its gradual camera speed.");
+          previous_dive_span = inward_span;
+          previous_return_span = outward_span;
+        }
+        if (julia_probe.minimum_span() <= .00003) {
+          const bool expected = deep_visits++ % 2 == 0;
+          if (julia_probe.julia_hold() != expected)
+            throw std::runtime_error("Julia excursions did not alternate deep holds.");
+        } else if (julia_probe.julia_hold()) {
+          throw std::runtime_error("Julia appeared at a shallow site.");
+        }
+        // Measure actual renderer seed coordinates, including the local orbit,
+        // over the complete excursion at 60 Hz, not just the base camera span.
+        if (julia_probe.julia_hold()) {
+          auto motion = julia_probe;
+          motion.advance(dive);
+          auto seed_position = [](const Camera& camera) {
+            return std::array<double, 2>{{camera.julia.x + camera.julia.seed_shift_x +
+                (camera.x - camera.julia.x) * camera.julia.seed_scale,
+                camera.julia.y + camera.julia.seed_shift_y +
+                (camera.y - camera.julia.y) * camera.julia.seed_scale}};
+          };
+          Camera previous_camera = motion.frame();
+          double peak_zoom = 0, peak_pan = 0;
+          constexpr double step = 1.0 / 60;
+          for (int sample = 0; sample < static_cast<int>(kJuliaHoldSeconds * 60); ++sample) {
+            motion.advance(step);
+            const Camera current = motion.frame();
+            const double old_span = previous_camera.span * previous_camera.julia.seed_scale;
+            const double new_span = current.span * current.julia.seed_scale;
+            const auto old_center = seed_position(previous_camera);
+            const auto new_center = seed_position(current);
+            peak_zoom = std::max(peak_zoom, std::abs(std::log(new_span / old_span)) / step);
+            peak_pan = std::max(peak_pan, std::hypot(new_center[0] - old_center[0],
+                new_center[1] - old_center[1]) / (std::sqrt(old_span * new_span) * step));
+            if (peak_zoom > kJuliaMaxLogZoomSpeed || peak_pan > kJuliaMaxPanSpeed)
+              throw std::runtime_error("Julia visible zoom or centering exceeded its gradual camera speed.");
+            previous_camera = current;
+          }
+          std::fprintf(stderr, "Julia motion cycle %d: peak log zoom %.6f/sec, pan %.6f view widths/sec\n",
+              cycle, peak_zoom, peak_pan);
+        }
+        const double hold_midpoint = julia_probe.hold_duration() * .5;
+        julia_probe.advance(julia_probe.dive_seconds() + hold_midpoint);
+        const Camera held = julia_probe.frame();
+        if (held.julia.amount != (julia_probe.julia_hold() ? 1.0 : 0.0))
+          throw std::runtime_error("Julia hold endpoint was not reached.");
+        julia_probe.advance(0);
+        if (julia_probe.frame().julia.amount != held.julia.amount)
+          throw std::runtime_error("Paused Julia hold advanced.");
+        CameraTransition mode_probe;
+        mode_probe.start(held, camera_at(0));
+        const Camera start = mode_probe.advance(0);
+        if (std::abs(start.julia.amount - held.julia.amount) > 1e-12)
+          throw std::runtime_error("Mode switch cut the Julia excursion.");
+        for (int i = 0; mode_probe.active() && i < 10000; ++i) mode_probe.advance(.05);
+        if (mode_probe.active() || mode_probe.advance(0).julia.amount != 0)
+          throw std::runtime_error("Mode switch failed to leave Julia.");
+        // Pass the return edge before moving to the next randomized site.
+        julia_probe.advance(julia_probe.cycle_duration() - julia_probe.dive_seconds() - hold_midpoint);
       }
     }
 
@@ -1307,7 +1636,7 @@ int run(bool smoke_test, bool cycle_test) {
         update_cursor(mode, window_focused, false);
       }
       if (smoke_test && total_frames == 36) {
-        journey.advance((journey.cycle_duration() - 42.0) * 0.78);
+        journey.advance(journey.dive_seconds() * 0.78);
         rotation_angle = 0.75;
       }
       if (smoke_test && (total_frames == 19 || total_frames == 25 || total_frames == 26)) {
@@ -1323,7 +1652,7 @@ int run(bool smoke_test, bool cycle_test) {
         menu_progress = menu_visible ? 1.0 : 0.0;
       }
       if (smoke_test && total_frames == 46)
-        journey.advance((journey.cycle_duration() - 42.0) * 0.21);
+        journey.advance(journey.dive_seconds() * 0.21);
       if (smoke_test && total_frames == 50) {
         palette_from = palette_to;
         palette_to = 4;
@@ -1332,10 +1661,16 @@ int run(bool smoke_test, bool cycle_test) {
       }
 
       auto now = std::chrono::steady_clock::now();
+      const double wall_dt = std::chrono::duration<double>(now - previous).count();
       const double dt = smoke_test ? 1.0 / 60.0 :
-          std::clamp(std::chrono::duration<double>(now - previous).count(), 0.0, 0.1);
+          std::clamp(wall_dt, 0.0, 0.1);
       previous = now;
-      color_time += dt;
+      trip_time += dt;
+      TripEffects effects = trip_effects(trip_time);
+      // Freeze all palette motion while folding, including its fade ramps.
+      const float target_breath = music_enabled && !music_muted && music.available()
+          ? std::clamp(music.envelope() * 12.0f, 0.0f, 1.0f) : 0.0f;
+      musical_breath += (target_breath - musical_breath) * static_cast<float>(1.0 - std::exp(-dt / 0.9));
       if (cycle_test) cycle_elapsed += dt;
       menu_progress = std::clamp(menu_progress + (menu_visible ? 1.0 : -1.0) * dt / 0.22,
                                  0.0, 1.0);
@@ -1348,8 +1683,16 @@ int run(bool smoke_test, bool cycle_test) {
         }
         if (rotation_enabled) rotation_angle += dt * 0.055 * rotation_direction;
       }
-      palette_fade = std::min(kPaletteFadeSeconds, palette_fade + dt);
-      if (auto_palette) {
+      Camera camera = dive_mode ? journey.frame() : camera_at(camera_time);
+      if (transition.active()) camera = transition.advance(camera_paused ? 0.0 : dt);
+      last_camera = camera;
+      camera.rotation = rotation_angle;
+      effects.folding *= folding_depth_weight(camera.span, dive_mode ? journey.minimum_span() : .00003);
+      if ((dive_mode && !journey.diving()) || transition.active() || camera.julia.amount > 0) effects.folding = 0;
+      effects.waves *= static_cast<float>(1.0 - camera.julia.amount);
+      if (effects.folding == 0) color_time += dt;
+      if (effects.folding == 0) palette_fade = std::min(kPaletteFadeSeconds, palette_fade + dt);
+      if (auto_palette && effects.folding == 0) {
         palette_timer += dt;
         if (palette_timer >= 25.0) {
           palette_from = palette_to;
@@ -1376,15 +1719,49 @@ int run(bool smoke_test, bool cycle_test) {
       const int render_w = std::clamp(static_cast<int>(std::lround(output_w * quality_scale)), 1, output_w);
       const int render_h = std::clamp(static_cast<int>(std::lround(output_h * quality_scale)), 1, output_h);
       renderer.resize(render_w, render_h, output_w, output_h);
-      Camera camera = dive_mode ? journey.frame() : camera_at(camera_time);
-      if (transition.active()) camera = transition.advance(camera_paused ? 0.0 : dt);
-      last_camera = camera;
-      camera.rotation = rotation_angle;
       music.set_depth(static_cast<float>(std::clamp(std::log2(3.2 / camera.span) / 17.0, 0.0, 1.0)));
       const float kernel_ms = renderer.draw(camera, palette_from, palette_to,
                                             static_cast<float>(palette_fade / kPaletteFadeSeconds),
                                             static_cast<float>(color_time),
-                                            output_w, output_h, journey.reference_point(), bloom_enabled);
+                                            output_w, output_h, journey.reference_point(), bloom_enabled,
+                                            effects, static_cast<float>(std::fmod(trip_time * 0.025, 6.28318530718)), musical_breath);
+      const double frame_work_ms = renderer.work_ms();
+      const bool frame_timing_ready = renderer.timing_sample_ready();
+      if (motion_test) {
+        const double seed_span = camera.span * camera.julia.seed_scale;
+        const double seed_x = camera.julia.amount > 0 ? camera.julia.x + camera.julia.seed_shift_x +
+            (camera.x - camera.julia.x) * camera.julia.seed_scale : camera.x;
+        const double seed_y = camera.julia.amount > 0 ? camera.julia.y + camera.julia.seed_shift_y +
+            (camera.y - camera.julia.y) * camera.julia.seed_scale : camera.y;
+        const double parameter_x = camera.julia.amount > 0 ? camera.julia.x + camera.julia.parameter_shift_x +
+            (camera.x - camera.julia.x) * (1 - camera.julia.amount) : camera.x;
+        const double parameter_y = camera.julia.amount > 0 ? camera.julia.y + camera.julia.parameter_shift_y +
+            (camera.y - camera.julia.y) * (1 - camera.julia.amount) : camera.y;
+        const bool has_previous = previous_motion_seed_span > 0 && wall_dt > 0;
+        const double base_speed = has_previous ? std::log(camera.span / previous_motion_base_span) / wall_dt : 0;
+        const double seed_speed = has_previous ? std::log(seed_span / previous_motion_seed_span) / wall_dt : 0;
+        const double pan_speed = has_previous ? std::hypot(seed_x - previous_motion_seed_x, seed_y - previous_motion_seed_y) /
+            (std::sqrt(seed_span * previous_motion_seed_span) * wall_dt) : 0;
+        const double journey_time = motion_offset + cycle_elapsed;
+        const char* stage = journey_time < journey.dive_seconds() ? "dive" :
+            journey_time < journey.dive_seconds() + journey.hold_duration() ? "hold" : "pullback";
+        std::fprintf(motion_trace.get(), "%.9f,%.9f,%s,%.9f,%.9f,%.17g,%.17g,%.9f,%.9f,%.9f,%.9f,%.17g,%.17g,%.17g,%.17g,%.9f,%d,%d,%.6f,%.6f\n",
+            std::chrono::duration<double>(now - motion_wall_start).count(), journey_time, stage, wall_dt, dt,
+            camera.span, seed_span, camera.julia.amount, base_speed, seed_speed, pan_speed, seed_x, seed_y,
+            parameter_x, parameter_y, camera.rotation, render_w, render_h, kernel_ms, frame_work_ms);
+        previous_motion_base_span = camera.span;
+        previous_motion_seed_span = seed_span;
+        previous_motion_seed_x = seed_x;
+        previous_motion_seed_y = seed_y;
+        if (total_frames % 60 == 0) std::fflush(motion_trace.get());
+      }
+      if (frame_timing_ready) {
+        ++valid_timing_samples;
+        if (smoke_test && (!std::isfinite(kernel_ms) || kernel_ms <= 0 ||
+            !std::isfinite(frame_work_ms) || frame_work_ms < kernel_ms ||
+            !std::isfinite(renderer.post_ms()) || renderer.post_ms() < 0))
+          throw std::runtime_error("Asynchronous GPU timing produced an invalid frame budget.");
+      }
       if (smoke_test && total_frames == 30) {
         save_screenshot(output_w, output_h, "smoke-bloom-on.bmp");
         renderer.present(false);
@@ -1392,9 +1769,9 @@ int run(bool smoke_test, bool cycle_test) {
         renderer.present(true);
       }
       if (cycle_test && cycle_elapsed >= next_cycle_log) {
-        std::fprintf(stderr, "cycle %.2f span %.6g render %dx%d output %dx%d kernel %.2fms work %.2fms post %.2fms\n",
+        std::fprintf(stderr, "cycle %.2f span %.6g render %dx%d output %dx%d kernel %.2fms work %.2fms post %.2fms fold %.3f julia %.3f\n",
                      cycle_elapsed, camera.span, render_w, render_h, output_w, output_h, kernel_ms,
-                     renderer.work_ms(), renderer.post_ms());
+                     renderer.work_ms(), renderer.post_ms(), renderer.folding_amount(), camera.julia.amount);
         std::fflush(stderr);
         next_cycle_log += 1.0;
       }
@@ -1406,7 +1783,9 @@ int run(bool smoke_test, bool cycle_test) {
         if (cycle_capture == 4) screenshot_requested = true;
         ++cycle_capture;
       }
-      if (cycle_test && cycle_elapsed >= test_cycle_duration + 2.0) running = false;
+      if (cycle_test && (motion_test
+          ? std::chrono::duration<double>(now - motion_wall_start).count() >= 120.0
+          : cycle_elapsed >= test_cycle_duration + 2.0)) running = false;
       if (smoke_test && (total_frames == 37 || total_frames == 45 || total_frames == 47)) {
         std::fprintf(stderr, "frame %d span %.3g render %dx%d output %dx%d kernel %.2fms scale %.2f\n",
                      total_frames, camera.span, render_w, render_h,
@@ -1422,6 +1801,49 @@ int run(bool smoke_test, bool cycle_test) {
                 false, false, 0, true, menu_opacity);
       if (smoke_test && total_frames == 45) renderer.check_deep_frame(camera, journey.minimum_span() * 20.0);
       if (smoke_test && total_frames == 47) renderer.check_deep_frame(camera, journey.minimum_span() * 1.1);
+      if (smoke_test && total_frames == 47) renderer.check_fallback_queue_lifecycle();
+      if (smoke_test && total_frames == 47) {
+        // Exercise every visual branch without waiting for the full sequence.
+        const double probes[] = {20.0, 68.0, 164.0, 260.0};
+        const char* names[] = {"smoke-waves.bmp", "smoke-fold-3.bmp", "smoke-fold-5.bmp", "smoke-fold-7.bmp"};
+        for (int probe = 0; probe < 4; ++probe) {
+          const auto visual = trip_effects(probes[probe]);
+          renderer.draw(camera, palette_from, palette_to,
+              static_cast<float>(palette_fade / kPaletteFadeSeconds), 20.0f,
+              output_w, output_h, journey.reference_point(), bloom_enabled,
+              visual, static_cast<float>(std::fmod(probes[probe] * 0.025, 6.28318530718)), 0.45f, true);
+          save_screenshot(output_w, output_h, names[probe]);
+        }
+        const char* julia_names[] = {"smoke-julia-start.bmp", "smoke-julia-in.bmp",
+                                    "smoke-julia-hold.bmp", "smoke-julia-out.bmp", "smoke-julia-return.bmp"};
+        const double hold_times[] = {0, kJuliaQuietSeconds + kJuliaRampSeconds * .5,
+            kJuliaHoldSeconds * .5, kJuliaPlateauEnd + kJuliaRampSeconds * .5, kJuliaHoldSeconds};
+        for (int probe = 0; probe < 5; ++probe) {
+          DiveJourney held_journey;
+          held_journey.advance(held_journey.dive_seconds() + hold_times[probe]);
+          Camera held = held_journey.frame();
+          held.rotation = camera.rotation;
+          renderer.draw(held, palette_from, palette_to,
+              static_cast<float>(palette_fade / kPaletteFadeSeconds), static_cast<float>(color_time),
+              output_w, output_h, held_journey.reference_point(), bloom_enabled, {}, 0, 0);
+          renderer.check_deep_frame(held, held_journey.minimum_span() * 1.1);
+          save_screenshot(output_w, output_h, julia_names[probe]);
+          if (probe == 2) {
+            CameraTransition exit_probe;
+            exit_probe.start(held, camera_at(0));
+            Camera leaving = exit_probe.advance(4.0);
+            leaving.rotation = camera.rotation;
+            renderer.draw(leaving, palette_from, palette_to,
+                static_cast<float>(palette_fade / kPaletteFadeSeconds), static_cast<float>(color_time),
+                output_w, output_h, held_journey.reference_point(), bloom_enabled, {}, 0, 0);
+            save_screenshot(output_w, output_h, "smoke-julia-mode-exit.bmp");
+          }
+        }
+        renderer.draw(camera, palette_from, palette_to,
+            static_cast<float>(palette_fade / kPaletteFadeSeconds), static_cast<float>(color_time),
+            output_w, output_h, journey.reference_point(), bloom_enabled,
+            effects, static_cast<float>(std::fmod(trip_time * 0.025, 6.28318530718)), musical_breath);
+      }
       if (screenshot_requested) {
         // Automated captures stay in the test directory, never in Pictures.
         const std::string filename = persist_settings
@@ -1465,12 +1887,12 @@ int run(bool smoke_test, bool cycle_test) {
       ++total_frames;
       if (smoke_test && smoke_pullback_saved) running = false;
       else if (smoke_test && smoke_final_saved && !smoke_pullback_pending) {
-        journey.advance(27.0);
+        journey.advance(journey.hold_duration() + journey.pullback_seconds() * .5);
         smoke_pullback_pending = true;
       }
       if (smoke_test && total_frames >= 1000) throw std::runtime_error("Palette fade smoke check timed out.");
 
-      frame_budget.observe(kernel_ms, renderer.work_ms());
+      if (frame_timing_ready) frame_budget.observe(kernel_ms, frame_work_ms);
 
       title_timer += dt;
       ++title_frames;
@@ -1500,6 +1922,11 @@ int run(bool smoke_test, bool cycle_test) {
           cycle_intervals[static_cast<size_t>((cycle_intervals.size() - 1) * 0.99)],
           late * 100.0 / cycle_intervals.size());
     }
+    if (smoke_test || cycle_test) {
+      if (valid_timing_samples < 8)
+        throw std::runtime_error("Asynchronous GPU timing failed to recycle its frame slots.");
+      std::fprintf(stderr, "Async GPU timing: %d valid frame samples\n", valid_timing_samples);
+    }
     if (smoke_test && pacing_samples > 0) {
       std::fprintf(stderr, "60 FPS cap: %d intervals, shortest %.3fms, average %.2f FPS\n",
                    pacing_samples, pacing_min_interval / 1.0e6,
@@ -1520,9 +1947,11 @@ int run(bool smoke_test, bool cycle_test) {
 
 int main(int argc, char** argv) {
   const bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";
-  const bool cycle_test = argc > 1 && std::string(argv[1]) == "--cycle-test";
+  const bool motion_test = argc > 1 && std::string(argv[1]) == "--motion-test";
+  const bool cycle_test = motion_test || (argc > 1 && std::string(argv[1]) == "--cycle-test");
   try {
-    return run(smoke_test, cycle_test);
+    const bool motion_return = motion_test && argc > 2 && std::string(argv[2]) == "return";
+    return run(smoke_test, cycle_test, motion_test, motion_return);
   } catch (const std::exception& error) {
     std::fprintf(stderr, "Mandel Drift: %s\n", error.what());
     if (!smoke_test && !cycle_test) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Mandel Drift", error.what(), nullptr);

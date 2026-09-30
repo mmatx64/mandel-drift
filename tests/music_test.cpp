@@ -1,5 +1,7 @@
 #include "ambient_music.h"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -28,32 +30,59 @@ int main(int argc, char** argv) {
     std::vector<float> samples(48000 * 2);
     std::vector<float> preview;
     double energy = 0, difference = 0;
-    float peak = 0, jump = 0, previous = 0;
-    for (int second = 0; second < 130; ++second) {
-      synth.render(samples.data(), 48000, 1, second < 65 ? 0 : 1);
+    constexpr int duration = 168; // Entire six-chord cycle, wrap, and depth change.
+    const auto started = std::chrono::steady_clock::now();
+    float peak = 0, jump = 0;
+    std::array<float, 2> previous{};
+    std::array<std::array<double, 2>, 2> carrier_sine{}, carrier_cosine{};
+    for (int second = 0; second < duration; ++second) {
+      synth.render(samples.data(), 48000, 1, second < duration / 2 ? 0 : 1);
       for (size_t i = 0; i < samples.size(); i += 2) {
         require(std::isfinite(samples[i]) && std::isfinite(samples[i + 1]), "Non-finite audio");
         peak = std::max({peak, std::abs(samples[i]), std::abs(samples[i + 1])});
-        jump = std::max(jump, std::abs(samples[i] - previous));
-        previous = samples[i];
+        for (int channel = 0; channel < 2; ++channel) {
+          jump = std::max(jump, std::abs(samples[i + channel] - previous[channel]));
+          previous[channel] = samples[i + channel];
+          if (second >= 20 && second < 40) {
+            const double time = second + (i / 2) / 48000.0;
+            for (int tone = 0; tone < 2; ++tone) {
+              const double phase = 6.283185307179586 * (200 + tone * 10) * time;
+              carrier_sine[channel][tone] += samples[i + channel] * std::sin(phase);
+              carrier_cosine[channel][tone] += samples[i + channel] * std::cos(phase);
+            }
+          }
+        }
         energy += samples[i] * samples[i];
         difference += std::abs(samples[i] - samples[i + 1]);
       }
-      if (argc > 1 && second < 40)
+      if (argc > 1 && second < 60)
         for (float sample : samples) preview.push_back(sample * 0.6f);
     }
     require(peak < 0.8f && peak > 0.05f, "Audio range or clipping");
-    require(energy / (48000 * 130) > 0.0001, "Unexpected silence");
+    require(energy / (48000 * duration) > 0.0001, "Unexpected silence");
     require(difference > 1, "Stereo image missing");
     require(jump < 0.04f, "Discontinuity across notes or chords");
+    for (int channel = 0; channel < 2; ++channel) {
+      const auto amplitude = [&](int tone) {
+        return 2 * std::hypot(carrier_sine[channel][tone], carrier_cosine[channel][tone]) / (20 * 48000);
+      };
+      const double intended = amplitude(channel);
+      require(intended > 0.007 && intended < 0.011, "Binaural carrier level incorrect");
+      require(amplitude(1 - channel) < intended * 0.4, "Binaural carriers leaked between channels");
+    }
     synth.render(samples.data(), 48000, 0, 1);
     require(std::all_of(samples.end() - 2000, samples.end(), [](float x) { return x == 0; }), "Mute did not settle to exact silence");
     synth.render(samples.data(), 48000, .35f, 0);
     require(std::abs(samples.front()) < 0.001f, "Unmute did not fade in");
     AmbientSynth a, b;
-    std::vector<float> whole(20000), split(20000);
-    a.render(whole.data(), 10000, .5f, .5f);
-    for (int offset = 0; offset < 10000; offset += 100) b.render(split.data() + offset * 2, 100, .5f, .5f);
+    constexpr int block_frames = 48000 * 27;
+    std::vector<float> whole(block_frames * 2), split(block_frames * 2);
+    a.render(whole.data(), block_frames, .5f, .5f);
+    for (int offset = 0; offset < block_frames;) {
+      const int count = std::min(137 + offset % 997, block_frames - offset);
+      b.render(split.data() + offset * 2, count, .5f, .5f);
+      offset += count;
+    }
     require(whole == split, "Synthesis depends on callback buffer size");
     if (argc > 1) wav(argv[1], preview);
 
@@ -64,6 +93,8 @@ int main(int argc, char** argv) {
       require(music.start(), SDL_GetError());
       SDL_Delay(150);
       require(music.rendered_frames() > 0 && music.available(), "Audio callback did not supply samples");
+      require(std::isfinite(music.envelope()) && music.envelope() > 0 && music.envelope() < .8f,
+              "Audio callback did not publish a valid breathing envelope");
       music.set_controls(true, true, 35);
       SDL_Delay(50);
       music.set_controls(false, false, 35);
@@ -75,8 +106,10 @@ int main(int argc, char** argv) {
       require(!missing.start() && !missing.available(), "Missing audio device must fail gracefully");
     }
     SDL_Quit();
-    std::cout << "130 seconds synthesized; peak=" << peak << ", maximum step=" << jump
-              << "; mute, unmute, stereo, buffer independence, callback and unavailable device passed.\n";
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::cout << duration << " seconds synthesized; peak=" << peak << ", maximum step=" << jump
+              << "; binaural separation, mute, unmute, stereo, buffer independence, callback and unavailable device passed in "
+              << elapsed << " seconds.\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

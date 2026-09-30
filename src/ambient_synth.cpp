@@ -5,14 +5,19 @@
 namespace {
 constexpr double pi = 3.14159265358979323846;
 constexpr int chords[6][4] = {
-    {50, 57, 60, 64}, {46, 53, 57, 62}, {48, 53, 57, 64},
-    {48, 55, 62, 64}, {50, 57, 60, 65}, {46, 53, 60, 65}};
-constexpr int roots[6] = {38, 34, 29, 36, 38, 34};
-constexpr int chord_frames = AmbientSynth::sample_rate * 18;
+    {48, 55, 62, 63}, {48, 55, 58, 63}, {48, 55, 60, 63},
+    {51, 58, 62, 65}, {53, 60, 63, 67}, {48, 55, 58, 62}};
+constexpr int roots[6] = {48, 44, 44, 51, 53, 48};
+constexpr int chord_frames = AmbientSynth::sample_rate * 24;
+// Two-second steps with breathing room; original phrase, no sample playback.
+constexpr int phrase[12] = {0, 2, 1, -1, 3, 2, 0, -1, 1, 2, 3, -1};
+constexpr int note_frames = AmbientSynth::sample_rate * 2;
 double frequency(int midi) { return 440.0 * std::exp2((midi - 69) / 12.0); }
 }
 
 AmbientSynth::AmbientSynth() : echo_left_(48000, 0), echo_right_(48000, 0) {
+  constexpr int lengths[] = {1499, 2111, 1601, 1987};
+  for (int i = 0; i < 4; ++i) diffusion_[i].resize(lengths[i], 0);
   for (int i = 0; i <= 2048; ++i) table_[i] = static_cast<float>(std::sin(2 * pi * i / 2048));
   for (int bank = 0; bank < 2; ++bank)
     for (int voice = 0; voice < 4; ++voice) frequencies_[bank][voice] = frequency(chords[bank][voice]);
@@ -21,9 +26,37 @@ AmbientSynth::AmbientSynth() : echo_left_(48000, 0), echo_right_(48000, 0) {
 float AmbientSynth::wave(double& phase, double hz) {
   phase += hz / sample_rate;
   phase -= std::floor(phase);
+  return sample(phase);
+}
+
+float AmbientSynth::sample(double phase) const {
+  phase -= std::floor(phase);
   const double index = phase * 2048;
   const int whole = static_cast<int>(index);
   return table_[whole] + static_cast<float>(index - whole) * (table_[whole + 1] - table_[whole]);
+}
+
+float AmbientSynth::pad(double& phase, double hz, float brightness) {
+  const float fundamental = wave(phase, hz);
+  // Round body and a soft upper sheen; keep high harmonics below the motif.
+  return fundamental + brightness * (0.30f * sample(phase * 2) +
+      0.12f * sample(phase * 3) + 0.045f * sample(phase * 4) +
+      0.018f * sample(phase * 6));
+}
+
+float AmbientSynth::diffuse(float value, int channel) {
+  // Two stable all-pass stages smear the long echoes without emphasizing a
+  // frequency band. Different prime lengths decorrelate the stereo tails.
+  for (int stage = channel * 2; stage < channel * 2 + 2; ++stage) {
+    auto& buffer = diffusion_[stage];
+    int& index = diffusion_index_[stage];
+    const float delayed = buffer[index];
+    const float output = delayed - value * 0.6f;
+    buffer[index] = value + output * 0.6f;
+    index = (index + 1) % static_cast<int>(buffer.size());
+    value = output;
+  }
+  return value;
 }
 
 void AmbientSynth::render(float* stereo, int frames, float target_gain, float target_depth) {
@@ -44,52 +77,67 @@ void AmbientSynth::render(float* stereo, int frames, float target_gain, float ta
       for (int voice = 0; voice < 4; ++voice)
         frequencies_[1 - bank_][voice] = frequency(chords[(chord_ + 1) % 6][voice]);
     }
-    const float cross = std::clamp((chord_frame / static_cast<float>(sample_rate) - 12.0f) / 6.0f, 0.0f, 1.0f);
+    const double seconds = frame_ / static_cast<double>(sample_rate);
+    const float cross = std::clamp((chord_frame / static_cast<float>(sample_rate) - 12.0f) / 12.0f, 0.0f, 1.0f);
     const float blend = cross * cross * (3 - 2 * cross);
     float left = 0, right = 0;
     for (int bank = 0; bank < 2; ++bank) {
       const float weight = bank == bank_ ? 1 - blend : blend;
       for (int voice = 0; voice < 4; ++voice) {
         const double hz = frequencies_[bank][voice];
-        const float a = wave(phases_[bank][voice * 2], hz * 0.9985);
-        const float b = wave(phases_[bank][voice * 2 + 1], hz * 1.0015);
-        // A quiet third harmonic, slowly brightened by dive depth.
-        const float warm_a = a + (0.04f + depth_ * 0.07f) * (3 * a - 4 * a * a * a);
-        const float warm_b = b + (0.04f + depth_ * 0.07f) * (3 * b - 4 * b * b * b);
-        const float pan = 0.25f + voice * 0.16f;
-        left += weight * (warm_a * (1 - pan) + warm_b * 0.15f) * 0.10f;
-        right += weight * (warm_b * pan + warm_a * 0.15f) * 0.10f;
+        const double drift = 0.00035 * sample(seconds / 23.0 + voice * 0.21);
+        const float a = pad(phases_[bank][voice * 2], hz * (0.9988 + drift), 0.85f + depth_ * 0.15f);
+        const float b = pad(phases_[bank][voice * 2 + 1], hz * (1.0012 - drift), 0.85f + depth_ * 0.15f);
+        const float swell = 0.85f + 0.15f * sample(seconds / (9.0 + voice * 1.9) + voice / (2 * pi));
+        const float level = voice < 2 ? 0.055f : 0.032f;
+        left += weight * swell * (a + b * 0.18f) * level;
+        right += weight * swell * (b + a * 0.18f) * level;
       }
     }
-    // Bass follows the chord with a six-second pitch glide during the crossfade.
-    const double root = frequency(roots[chord_]) * (1 - blend) + frequency(roots[(chord_ + 1) % 6]) * blend;
-    const float pulse = 0.8f + 0.2f * static_cast<float>(std::sin(frame_ * (2 * pi / (sample_rate * 6.0))));
-    const float bass = wave(bass_phase_, root) * 0.12f * pulse;
-    // Sparse notes remain in the active harmony; long stereo echoes fill the gaps.
-    constexpr int note_frames = sample_rate * 3;
+    // Crossfade two tuned roots instead of sliding through unrelated pitches.
+    const float bass = (wave(bass_phases_[bank_], frequency(roots[chord_])) * (1 - blend) +
+        wave(bass_phases_[1 - bank_], frequency(roots[(chord_ + 1) % 6])) * blend) * 0.014f;
+    // Independent voices let each note decay beneath the next, with no retrigger clicks.
     if (frame_ % note_frames == 0) {
-      const int step = static_cast<int>((frame_ / note_frames) % 8);
-      if (step != 3 && step != 7) {
-        const int voice = (step * 3 + chord_) % 4;
-        bell_frequency_ = frequency(chords[chord_][voice] + 12);
-        bell_envelope_ = 1;
-        bell_attack_ = 0;
+      const auto step = frame_ / note_frames;
+      const int voice = phrase[step % 12];
+      if (voice >= 0) {
+        auto& note = notes_[step % notes_.size()];
+        // Follow the louder pad bank halfway through each harmonic transition.
+        const int harmony = blend < 0.5f ? chord_ : (chord_ + 1) % 6;
+        note.frequency = frequency(chords[harmony][voice] + 12);
+        note.envelope = 1;
+        note.attack = 0;
+        note.pan = step % 2 == 0 ? 0.32f : 0.68f;
       }
     }
-    bell_envelope_ *= 0.999975f;
-    bell_attack_ += (1 - bell_attack_) * 0.0005f;
-    const float bell = wave(bell_phase_, bell_frequency_) * bell_envelope_ * bell_attack_ * (0.035f + 0.035f * depth_);
-    left += bass + bell * 0.75f;
-    right += bass + bell * 0.50f;
+    for (auto& note : notes_) {
+      note.envelope *= 0.999981f;
+      note.attack += (1 - note.attack) * 0.00022f;
+      const float tone = wave(note.phase, note.frequency) + 0.10f * sample(note.phase * 2);
+      const float bell = tone * note.envelope * note.attack * (0.036f + 0.004f * depth_);
+      left += bell * (1 - note.pan);
+      right += bell * note.pan;
+    }
+    left += bass;
+    right += bass;
     const float echo_l = echo_left_[(echo_index_ + 48000 - 31200) % 48000];
     const float echo_r = echo_right_[(echo_index_ + 48000 - 40800) % 48000];
-    low_left_ += (echo_r - low_left_) * 0.12f;
-    low_right_ += (echo_l - low_right_) * 0.12f;
-    echo_left_[echo_index_] = left + low_left_ * 0.42f;
-    echo_right_[echo_index_] = right + low_right_ * 0.42f;
+    low_left_ += (echo_r - low_left_) * 0.045f;
+    low_right_ += (echo_l - low_right_) * 0.045f;
+    echo_left_[echo_index_] = left + low_left_ * 0.68f;
+    echo_right_[echo_index_] = right + low_right_ * 0.68f;
     echo_index_ = (echo_index_ + 1) % 48000;
-    stereo[i * 2] = std::tanh((left + echo_l * 0.32f) * 1.25f) * gain_ * 0.8f;
-    stereo[i * 2 + 1] = std::tanh((right + echo_r * 0.32f) * 1.25f) * gain_ * 0.8f;
+    pad_low_left_ += (left + diffuse(echo_l, 0) * 0.55f - pad_low_left_) * 0.12f;
+    pad_low_right_ += (right + diffuse(echo_r, 1) * 0.55f - pad_low_right_) * 0.12f;
+    const float fade = static_cast<float>(std::min(frame_ / (sample_rate * 4.0), 1.0));
+    const float attack = fade * fade * (3 - 2 * fade);
+    // Quiet 200/210 Hz carriers: a 10 Hz difference on headphones. Keep these
+    // channel-specific and outside crossfeed/reverb and music saturation.
+    const float binaural_left = wave(binaural_phases_[0], 200) * 0.009f;
+    const float binaural_right = wave(binaural_phases_[1], 210) * 0.009f;
+    stereo[i * 2] = (std::tanh(pad_low_left_ * 1.25f) * 0.8f + binaural_left) * gain_ * attack;
+    stereo[i * 2 + 1] = (std::tanh(pad_low_right_ * 1.25f) * 0.8f + binaural_right) * gain_ * attack;
     ++frame_;
   }
 }
