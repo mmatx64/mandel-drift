@@ -10,6 +10,8 @@
 #include "settings_overlay.h"
 #include "app_settings.h"
 #include "ambient_music.h"
+#include "music_travel.h"
+#include "music_reactivity.h"
 #include "bloom_shaders.h"
 #include "frame_budget.h"
 #include "trip_effects.h"
@@ -144,7 +146,6 @@ uniform int palette_to;
 uniform float palette_blend;
 uniform float palette_time;
 uniform vec4 trip; // wave amount, folding amount, symmetry count, rotation
-uniform float musical_breath;
 
 vec3 ramp(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
   float u = fract(t) * 3.0;
@@ -199,10 +200,21 @@ vec3 color_escape(float escape) {
   }
 }
 
-void main() {
+vec3 sample_color(vec2 sample_uv) {
   // Escape counts are nonlinear palette inputs; interpolate colors instead.
   ivec2 size = ivec2(escape_size);
-  vec2 sample_uv = uv;
+  vec2 pos = sample_uv * vec2(size) - 0.5;
+  ivec2 p = ivec2(floor(pos));
+  vec2 f = fract(pos);
+  vec3 a = color_escape(texelFetch(escape_texture, clamp(p, ivec2(0), size - 1), 0).r);
+  vec3 b = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,0), ivec2(0), size - 1), 0).r);
+  vec3 c = color_escape(texelFetch(escape_texture, clamp(p + ivec2(0,1), ivec2(0), size - 1), 0).r);
+  vec3 d = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,1), ivec2(0), size - 1), 0).r);
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+
+void main() {
+  vec3 color = trip.y < 1.0 ? sample_color(uv) : vec3(0.0);
   if (trip.y > 0.0) {
     float aspect = escape_size.x / escape_size.y;
     vec2 centered = (uv - 0.5) * vec2(aspect, 1.0);
@@ -213,16 +225,10 @@ void main() {
     // Keep rotated corners inside the source image, avoiding clamped streaks.
     float fit = 0.48 * min(aspect, 1.0) / length(vec2(aspect, 1.0) * 0.5);
     vec2 target = radius * fit * vec2(cos(folded), sin(folded)) / vec2(aspect, 1.0);
-    sample_uv = 0.5 + mix(centered / vec2(aspect, 1.0), target, trip.y);
+    // Fade complete images: fractional strength never bends the fold geometry.
+    color = mix(color, sample_color(0.5 + target), trip.y);
   }
-  vec2 pos = sample_uv * vec2(size) - 0.5;
-  ivec2 p = ivec2(floor(pos));
-  vec2 f = fract(pos);
-  vec3 a = color_escape(texelFetch(escape_texture, clamp(p, ivec2(0), size - 1), 0).r);
-  vec3 b = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,0), ivec2(0), size - 1), 0).r);
-  vec3 c = color_escape(texelFetch(escape_texture, clamp(p + ivec2(0,1), ivec2(0), size - 1), 0).r);
-  vec3 d = color_escape(texelFetch(escape_texture, clamp(p + ivec2(1,1), ivec2(0), size - 1), 0).r);
-  frag_color = vec4(mix(mix(a,b,f.x), mix(c,d,f.x), f.y) * (1.0 + musical_breath * 0.16), 1.0);
+  frag_color = vec4(color, 1.0);
 }
 )GLSL";
 
@@ -538,7 +544,6 @@ class Renderer {
     palette_blend_location_ = gl_.GetUniformLocation(program_, "palette_blend");
     time_location_ = gl_.GetUniformLocation(program_, "palette_time");
     trip_location_ = gl_.GetUniformLocation(program_, "trip");
-    breath_location_ = gl_.GetUniformLocation(program_, "musical_breath");
     escape_size_location_ = gl_.GetUniformLocation(program_, "escape_size");
     gl_.UseProgram(temporal_program_);
     gl_.Uniform1i(gl_.GetUniformLocation(temporal_program_, "current_color"), 0);
@@ -553,6 +558,7 @@ class Renderer {
     gl_.Uniform1i(gl_.GetUniformLocation(bloom_blur_program_, "source_color"), 0);
     bloom_direction_location_ = gl_.GetUniformLocation(bloom_blur_program_, "direction");
     gl_.UseProgram(bloom_composite_program_);
+    breath_location_ = gl_.GetUniformLocation(bloom_composite_program_, "musical_glow");
     gl_.Uniform1i(gl_.GetUniformLocation(bloom_composite_program_, "scene_color"), 0);
     gl_.Uniform1i(gl_.GetUniformLocation(bloom_composite_program_, "glow_color"), 1);
   }
@@ -734,11 +740,14 @@ class Renderer {
     if (probe_fold) {
       float4 detail;
       check_cuda(cudaMemcpy(&detail, fold_detail_, sizeof(detail), cudaMemcpyDeviceToHost), "Read fold detail summary");
-      fold_detail_target_ = folding_detail_weight(detail.x, detail.y, detail.z, detail.w);
+      const float confidence = folding_detail_weight(detail.x, detail.y, detail.z, detail.w);
+      // Hysteresis avoids hovering at a permanently weakened fold in good detail.
+      fold_detail_target_ = confidence >= .25f || (fold_detail_target_ > 0 && confidence > 0) ? 1.0f : 0;
     }
     const double effect_dt = previous_effect_time_ ? std::min((draw_start - previous_effect_time_) / 1.0e9, .1) : 0;
     previous_effect_time_ = draw_start;
     fold_detail_weight_ += (fold_detail_target_ - fold_detail_weight_) * static_cast<float>(1 - std::exp(-effect_dt / .6));
+    if (std::abs(fold_detail_target_ - fold_detail_weight_) < .001f) fold_detail_weight_ = fold_detail_target_;
     if (!visual_probe) effects.folding *= fold_detail_weight_;
     if (effects.folding < .001f) effects.folding = 0;
     if (timing) {
@@ -767,7 +776,7 @@ class Renderer {
     gl_.Uniform1f(palette_blend_location_, palette_blend);
     gl_.Uniform1f(time_location_, palette_time);
     gl_.Uniform4f(trip_location_, effects.waves, effects.folding, static_cast<float>(effects.folds), fold_angle);
-    gl_.Uniform1f(breath_location_, musical_breath);
+    musical_breath_ = std::clamp(musical_breath, 0.0f, 1.0f);
     gl_.Uniform2f(escape_size_location_, static_cast<float>(width_), static_cast<float>(height_));
     gl_.BindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -782,7 +791,7 @@ class Renderer {
     float weight = history_valid_ ? 0.78f : 0.0f;
     // A changing nonlinear fold cannot use the camera's affine reprojection.
     // Suppress stale history through folding and its first normal frame.
-    if (effects.folding > 0 || previous_folding_ > 0) weight = 0.0f;
+    if (effects.folding > 0 || previous_folding_ > 0 || visual_probe) weight = 0.0f;
     // Parameter morphs do not follow affine camera motion. Frozen Julia views
     // can accumulate history again; changing parameters and both edges cannot.
     if (camera.julia.amount != previous_camera_.julia.amount ||
@@ -856,12 +865,16 @@ class Renderer {
                       pass == 1 ? 1.0f / bloom_height_ : 0.0f);
         glDrawArrays(GL_TRIANGLES, 0, 3);
       }
+    }
+    if (bloom_enabled || musical_breath_ > 0) {
       gl_.BindFramebuffer(GL_FRAMEBUFFER, 0);
       glViewport(0, 0, history_width_, history_height_);
       gl_.UseProgram(bloom_composite_program_);
+      gl_.Uniform2f(breath_location_, musical_breath_, bloom_enabled ? .22f + .24f * musical_breath_ : 0);
+      gl_.ActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, history_color_[history_index_]);
       gl_.ActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, bloom_color_[0]);
+      glBindTexture(GL_TEXTURE_2D, bloom_enabled ? bloom_color_[0] : history_color_[history_index_]);
       glDrawArrays(GL_TRIANGLES, 0, 3);
     } else {
       gl_.BindFramebuffer(GL_READ_FRAMEBUFFER, history_fbo_[history_index_]);
@@ -1082,6 +1095,7 @@ class Renderer {
   GLint time_location_ = -1;
   GLint trip_location_ = -1;
   GLint breath_location_ = -1;
+  float musical_breath_ = 0;
   float previous_folding_ = 0;
   GLint matrix_location_ = -1;
   GLint translation_location_ = -1;
@@ -1264,6 +1278,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
     double previous_motion_seed_x = 0, previous_motion_seed_y = 0;
     const auto motion_wall_start = std::chrono::steady_clock::now();
     float musical_breath = 0;
+    AudioBreath audio_breath;
     double palette_timer = 0.0;
     FrameBudget frame_budget;
     std::vector<double> cycle_intervals;
@@ -1271,6 +1286,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
     int last_output_h = 0;
     double title_timer = 0.0;
     int title_frames = 0;
+    double display_fps = 0.0, display_render_ms = 0.0;
     int total_frames = 0;
     int valid_timing_samples = 0;
     bool screenshot_requested = false;
@@ -1531,8 +1547,10 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
           int window_w = 0, window_h = 0, drawable_w = 0, drawable_h = 0;
           SDL_GetWindowSize(window, &window_w, &window_h);
           SDL_GetWindowSizeInPixels(window, &drawable_w, &drawable_h);
-          if (window_w > 0 && drawable_w > 0 && drawable_h > 0)
+          if (window_w > 0 && drawable_w > 0 && drawable_h > 0) {
             music_volume = settings.volume_at(event.motion.x * drawable_w / window_w, drawable_w, drawable_h);
+            music_muted = false;
+          }
         }
         if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
             menu_visible && menu_progress > 0.4) {
@@ -1556,13 +1574,13 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
               bloom_enabled = !bloom_enabled;
             } else if (control == 4) {
               music_enabled = !music_enabled;
+              if (music_enabled) music_muted = false;
               if (music_enabled && persist_settings && !music.start())
                 std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError());
             } else if (control == 5) {
               volume_dragging = true;
               music_volume = settings.volume_at(event.button.x * drawable_w / window_w, drawable_w, drawable_h);
-            } else if (control == 6) {
-              music_muted = !music_muted;
+              music_muted = false;
             }
           }
         }
@@ -1596,8 +1614,14 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
               music_muted = !music_muted;
             }
             break;
-          case SDLK_MINUS: music_volume = std::max(0, music_volume - 5); break;
-          case SDLK_EQUALS: music_volume = std::min(100, music_volume + 5); break;
+          case SDLK_MINUS:
+            music_volume = std::max(0, (music_muted ? 0 : music_volume) - 5);
+            music_muted = false;
+            break;
+          case SDLK_EQUALS:
+            music_volume = std::min(100, (music_muted ? 0 : music_volume) + 5);
+            music_muted = false;
+            break;
           case SDLK_F:
             toggle_window_mode(window, mode);
             break;
@@ -1702,9 +1726,8 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
       trip_time += dt;
       TripEffects effects = trip_effects(trip_time);
       // Freeze all palette motion while folding, including its fade ramps.
-      const float target_breath = music_enabled && !music_muted && music.available()
-          ? std::clamp(music.envelope() * 12.0f, 0.0f, 1.0f) : 0.0f;
-      musical_breath += (target_breath - musical_breath) * static_cast<float>(1.0 - std::exp(-dt / 0.9));
+      musical_breath = audio_breath.advance(music.musical_level(), dt,
+          music_enabled && !music_muted && music_volume > 0 && music.available());
       if (cycle_test) cycle_elapsed += dt;
       menu_progress = std::clamp(menu_progress + (menu_visible ? 1.0 : -1.0) * dt / 0.22,
                                  0.0, 1.0);
@@ -1753,7 +1776,9 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
       const int render_w = std::clamp(static_cast<int>(std::lround(output_w * quality_scale)), 1, output_w);
       const int render_h = std::clamp(static_cast<int>(std::lround(output_h * quality_scale)), 1, output_h);
       renderer.resize(render_w, render_h, output_w, output_h);
-      music.set_depth(static_cast<float>(std::clamp(std::log2(3.2 / camera.span) / 17.0, 0.0, 1.0)));
+      music.set_travel(music_travel_depth(camera.span, camera.julia.seed_scale,
+                                         dive_mode ? journey.minimum_span() : .0045),
+                       static_cast<float>(camera.julia.amount));
       const float kernel_ms = renderer.draw(camera, palette_from, palette_to,
                                             static_cast<float>(palette_fade / kPaletteFadeSeconds),
                                             static_cast<float>(color_time),
@@ -1829,7 +1854,8 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
                                                     (3.0 - 2.0 * menu_progress));
       settings.draw(output_w, output_h, menu_opacity,
                     auto_palette, random_palette_order, dive_mode, bloom_enabled,
-                    music_enabled, music_muted, music_volume, smoke_test || music.available());
+                    music_enabled, music_muted, music_volume, smoke_test || music.available(),
+                    0.0f, display_fps, display_render_ms);
       const float help_opacity = static_cast<float>(help_progress * help_progress * (3.0 - 2.0 * help_progress));
       help.draw(output_w, output_h, help_opacity, false, false, false, false,
                 false, false, 0, true, menu_opacity);
@@ -1847,6 +1873,24 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
               output_w, output_h, journey.reference_point(), bloom_enabled,
               visual, static_cast<float>(std::fmod(probes[probe] * 0.025, 6.28318530718)), 0.45f, true);
           save_screenshot(output_w, output_h, names[probe]);
+        }
+        const float fold_strengths[] = {0, .5f, 1};
+        const char* fade_names[] = {"smoke-fold-normal.bmp", "smoke-fold-half.bmp", "smoke-fold-full.bmp"};
+        for (int probe = 0; probe < 3; ++probe) {
+          renderer.draw(camera, palette_from, palette_to,
+              static_cast<float>(palette_fade / kPaletteFadeSeconds), 20.0f,
+              output_w, output_h, journey.reference_point(), false,
+              {0, fold_strengths[probe], 3}, 1.7f, 0, true);
+          save_screenshot(output_w, output_h, fade_names[probe]);
+        }
+        for (int probe = 0; probe < 4; ++probe) {
+          renderer.draw(camera, palette_from, palette_to,
+              static_cast<float>(palette_fade / kPaletteFadeSeconds), 20.0f,
+              output_w, output_h, journey.reference_point(), probe >= 2,
+              {}, 0, probe % 2 == 0 ? 0.0f : 1.0f, true);
+          const char* breath_names[] = {"smoke-breath-low.bmp", "smoke-breath-high.bmp",
+              "smoke-breath-bloom-low.bmp", "smoke-breath-bloom-high.bmp"};
+          save_screenshot(output_w, output_h, breath_names[probe]);
         }
         const char* julia_names[] = {"smoke-julia-start.bmp", "smoke-julia-in.bmp",
                                     "smoke-julia-hold.bmp", "smoke-julia-out.bmp", "smoke-julia-return.bmp"};
@@ -1909,6 +1953,10 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
       if (smoke_test && total_frames > 50 && !smoke_final_saved &&
           palette_fade >= kPaletteFadeSeconds) {
         save_screenshot(output_w, output_h, "smoke-vapor.bmp");
+        settings.draw(output_w, output_h, 1.0f,
+            auto_palette, random_palette_order, dive_mode, bloom_enabled,
+            music_enabled, music_muted, music_volume, true, 0.0f, display_fps, display_render_ms);
+        save_screenshot(output_w, output_h, "smoke-settings-stats.bmp");
         smoke_final_saved = true;
       }
       if (smoke_test && smoke_pullback_pending && !smoke_pullback_saved) {
@@ -1931,6 +1979,8 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
       title_timer += dt;
       ++title_frames;
       if (title_timer >= 1.0) {
+        display_fps = title_frames / title_timer;
+        display_render_ms = frame_budget.work_ms();
         char title[256];
         std::snprintf(title, sizeof(title),
             "Mandel Drift | %s | %s%s%s | %s | roll %s | %.0f FPS | render %.1f ms | %.0f%%",
@@ -1938,7 +1988,7 @@ int run(bool smoke_test, bool cycle_test, bool motion_test = false, bool motion_
             auto_palette ? (random_palette_order ? ", random)" : ")") : "",
             dive_mode ? "Dive" : "Tour",
             rotation_enabled ? "on" : "off",
-            title_frames / title_timer, frame_budget.work_ms(), quality_scale * 100.0);
+            display_fps, display_render_ms, quality_scale * 100.0);
         SDL_SetWindowTitle(window, title);
         title_timer = 0.0;
         title_frames = 0;

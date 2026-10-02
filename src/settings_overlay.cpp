@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,6 +20,9 @@ namespace {
 
 constexpr int kWidth = 1200;
 constexpr int kHeight = 250;
+constexpr int kPerformanceLeft = 215, kPerformanceTop = 19;
+constexpr int kPerformanceWidth = 420, kPerformanceHeight = 32;
+constexpr float kSliderLeft = 480, kSliderWidth = 590;
 
 template <typename T> T gl_proc(const char* name) {
   auto* address = SDL_GL_GetProcAddress(name);
@@ -112,9 +116,10 @@ GLuint menu_program() {
 struct Color { unsigned char r, g, b, a; };
 using Image = std::vector<unsigned char>;
 
-void pixel(Image& image, int x, int y, Color color) {
-  if (x < 0 || x >= kWidth || y < 0 || y >= kHeight || !color.a) return;
-  const size_t index = (static_cast<size_t>(y) * kWidth + x) * 4;
+void pixel(Image& image, int x, int y, Color color, int image_width = kWidth) {
+  const int image_height = static_cast<int>(image.size() / (image_width * 4));
+  if (x < 0 || x >= image_width || y < 0 || y >= image_height || !color.a) return;
+  const size_t index = (static_cast<size_t>(y) * image_width + x) * 4;
   const float source = color.a / 255.0f;
   const float destination = image[index + 3] / 255.0f;
   const float out = source + destination * (1.0f - source);
@@ -147,7 +152,8 @@ void rounded(Image& image, float left, float top, float width, float height,
   }
 }
 
-void text(Image& image, int x, int y, const wchar_t* words, int size, Color color) {
+void text(Image& image, int x, int y, const wchar_t* words, int size, Color color,
+          int image_width = kWidth) {
   constexpr int width = 1200;
   constexpr int height = 52;
   BITMAPINFO info{};
@@ -172,12 +178,13 @@ void text(Image& image, int x, int y, const wchar_t* words, int size, Color colo
   SetTextColor(dc, RGB(255, 255, 255));
   TextOutW(dc, 0, 0, words, static_cast<int>(wcslen(words)));
   const auto* source = static_cast<const unsigned char*>(bits);
-  for (int py = 0; py < height && y + py < kHeight; ++py) {
-    for (int px = 0; px < width && x + px < kWidth; ++px) {
+  const int image_height = static_cast<int>(image.size() / (image_width * 4));
+  for (int py = 0; py < height && y + py < image_height; ++py) {
+    for (int px = 0; px < width && x + px < image_width; ++px) {
       const size_t index = (static_cast<size_t>(py) * width + px) * 4;
       const unsigned char coverage = std::max({source[index], source[index + 1], source[index + 2]});
       pixel(image, x + px, y + py, {color.r, color.g, color.b,
-            static_cast<unsigned char>(coverage * color.a / 255)});
+            static_cast<unsigned char>(coverage * color.a / 255)}, image_width);
     }
   }
   SelectObject(dc, old_font);
@@ -303,27 +310,55 @@ void SettingsOverlay::update_texture(bool auto_palette, bool shuffle, bool endle
     text(image, 47, 190, L"Music", 21, {247, 240, 255, 255});
     toggle(image, 202, music, 181);
     text(image, 331, 190, L"Volume", 21, {247, 240, 255, 255});
-    const float slider_value = 480.0f + 490.0f * volume / 100.0f;
-    rounded(image, 480, 198, 490, 8, 4, {82, 53, 115, 240});
-    if (volume > 0) rounded(image, 480, 198, slider_value - 480, 8, 4, {25, 211, 232, 240});
+    const int displayed_volume = muted ? 0 : std::clamp(volume, 0, 100);
+    const float slider_value = kSliderLeft + kSliderWidth * displayed_volume / 100.0f;
+    rounded(image, kSliderLeft, 198, kSliderWidth, 8, 4, {82, 53, 115, 240});
+    if (displayed_volume > 0)
+      rounded(image, kSliderLeft, 198, slider_value - kSliderLeft, 8, 4, {25, 211, 232, 240});
     rounded(image, slider_value - 9, 193, 18, 18, 9, {231, 255, 255, 255});
-    const std::wstring percent = std::to_wstring(volume) + L"%";
-    text(image, 990, 190, percent.c_str(), 21, {247, 240, 255, 255});
-    text(image, 1060, 194, muted ? L"MUTED" : L"MUTE", 17,
-         muted ? Color{247, 93, 180, 255} : Color{150, 233, 244, 255});
+    const std::wstring percent = std::to_wstring(displayed_volume) + L"%";
+    text(image, 1100, 190, percent.c_str(), 21, {247, 240, 255, 255});
     if (music && !audio_available) text(image, 47, 220, L"Audio unavailable", 13, {247, 130, 190, 255});
   }
   gl().active_texture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, texture_);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kWidth, kHeight, 0,
                GL_RGBA, GL_UNSIGNED_BYTE, image.data());
+  if (!help_) {
+    // Retain just the clean header patch. Changing telemetry never redraws
+    // the panel, controls, or help texture.
+    performance_background_.resize(kPerformanceWidth * kPerformanceHeight * 4);
+    for (int y = 0; y < kPerformanceHeight; ++y)
+      std::copy_n(image.data() + ((y + kPerformanceTop) * kWidth + kPerformanceLeft) * 4,
+          kPerformanceWidth * 4, performance_background_.data() + y * kPerformanceWidth * 4);
+    performance_text_.clear();
+  }
+}
+
+void SettingsOverlay::update_performance(double fps, double render_ms) {
+  if (help_) return;
+  wchar_t label[80]{};
+  if (std::isfinite(fps) && fps > 0 && std::isfinite(render_ms) && render_ms > 0)
+    std::swprintf(label, std::size(label), L"|  %.0f FPS  |  render %.1f ms", fps, render_ms);
+  else
+    std::swprintf(label, std::size(label), L"|  -- FPS  |  render -- ms");
+  if (performance_text_ == label) return;
+  performance_text_ = label;
+  Image patch = performance_background_;
+  text(patch, 0, 0, label, 19, {157, 238, 250, 255}, kPerformanceWidth);
+  gl().active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, texture_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, kPerformanceLeft, kPerformanceTop,
+      kPerformanceWidth, kPerformanceHeight, GL_RGBA, GL_UNSIGNED_BYTE, patch.data());
 }
 
 void SettingsOverlay::draw(int width, int height, float opacity,
                            bool auto_palette, bool shuffle, bool endless_dive, bool bloom,
-                           bool music, bool muted, int volume, bool audio_available, float settings_progress) {
+                           bool music, bool muted, int volume, bool audio_available, float settings_progress,
+                           double fps, double render_ms) {
   if (opacity <= 0.0f) return;
   update_texture(auto_palette, shuffle, endless_dive, bloom, music, muted, volume, audio_available);
+  update_performance(fps, render_ms);
   const Placement where = placement(width, height, help_ ? settings_progress : 0.0f);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -355,8 +390,7 @@ int SettingsOverlay::hit_test(float mouse_x, float mouse_y, int width, int heigh
   if (x < 32 || x >= 1170) return -1;
   if (y >= 171 && y < 234) {
     if (x < 317) return 4;
-    if (x >= 460 && x <= 985) return 5;
-    if (x >= 1050) return 6;
+    if (x >= kSliderLeft - 20 && x <= kSliderLeft + kSliderWidth + 15) return 5;
     return -1;
   }
   if (y < 65 || y >= 151) return -1;
@@ -369,5 +403,5 @@ int SettingsOverlay::hit_test(float mouse_x, float mouse_y, int width, int heigh
 int SettingsOverlay::volume_at(float mouse_x, int width, int height) const {
   const Placement where = placement(width, height);
   const float x = (mouse_x - where.left) * kWidth / where.width;
-  return std::clamp(static_cast<int>(std::lround((x - 480) * 100 / 490)), 0, 100);
+  return std::clamp(static_cast<int>(std::lround((x - kSliderLeft) * 100 / kSliderWidth)), 0, 100);
 }

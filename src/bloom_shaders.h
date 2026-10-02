@@ -40,10 +40,12 @@ in vec2 uv;
 out vec4 frag_color;
 uniform sampler2D scene_color;
 uniform sampler2D glow_color;
+uniform vec2 musical_glow; // musical swell, bloom strength (zero when disabled)
 void main() {
   vec3 scene = texture(scene_color, uv).rgb;
-  vec3 glow = texture(glow_color, uv).rgb;
-  // A restrained screen blend preserves saturated highlights and crisp detail.
-  frag_color = vec4(scene + 0.22 * glow * (1.0 - scene), 1.0);
+  scene += 0.65 * musical_glow.x * scene * (1.0 - scene);
+  vec3 glow = musical_glow.y > 0.0 ? texture(glow_color, uv).rgb : vec3(0.0);
+  // Bounded midtone lift and screen blend preserve black and saturated detail.
+  frag_color = vec4(scene + musical_glow.y * glow * (1.0 - scene), 1.0);
 }
 )GLSL";
